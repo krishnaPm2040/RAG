@@ -1,0 +1,18 @@
+pymupdf
+pdfplumber
+OCRmyPDF
+python-dotenv
+langchain-core
+langchain-text-splitters
+langchain-experimental     # semantic chunking
+langchain-ollama           # Ollama embeddings (local or cloud)
+ollama
+langchain-chroma
+chromadb
+# evaluation + retrieval improvements
+pandas
+openpyxl                   # reads qa_test_set.xlsx
+rank_bm25                  # BM25 keyword search (hybrid)
+sentence-transformers      # cross-encoder re-ranker
+ragas
+datasets

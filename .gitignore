@@ -1,0 +1,9 @@
+vector_db/
+output/
+.venv/
+.venv-ragas/
+__pycache__/
+*.complete.json
+.env
+rename_map.csv
+.vscode/

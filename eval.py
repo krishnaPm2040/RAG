@@ -14,6 +14,12 @@ a header row. Columns (in this order when there is no header):
   python eval.py --strategy=recursive --hybrid --rerank --rewrite      -> + query rewriting
   add --ragas to any line to also score faithfulness + answer relevance (slower)
   add --test=myfile.csv to use another question file
+  add --k=5 to change the k used to score EVERY setup (default 5)
+
+  python eval.py --report       -> eval_report.md: before/after table from eval_results.csv
+
+Fair comparison: every setup is scored on the SAME k (Hit@1, Hit@3, Hit@k, MRR@k),
+even though the chatbot itself gives 3 sources (5 with the re-ranker) to the LLM.
 
 Every run:
   - adds one row to eval_results.csv            (compare before / after)
@@ -21,6 +27,7 @@ Every run:
 """
 
 import csv
+import hashlib
 import json
 import re
 import sys
@@ -30,6 +37,11 @@ from pathlib import Path
 import app
 from app import get_vector_db, llm, embeddings, CHUNK_STRATEGY
 
+EVAL_K = 5                                      # Day 4 #1: the SAME k for every setup
+for _arg in sys.argv:
+    if _arg.startswith("--k="):
+        EVAL_K = int(_arg.split("=", 1)[1])
+
 # Works with your app.py as it is: uses its functions when they exist,
 # otherwise does the same simple search + prompt itself.
 USE_HYBRID = getattr(app, "USE_HYBRID", False)
@@ -38,10 +50,18 @@ USE_REWRITE = getattr(app, "USE_REWRITE", False)
 MIN_RELEVANCE = getattr(app, "MIN_RELEVANCE", 0.0)
 
 
-def retrieve(vector_db, question):
+def retrieve(vector_db, question, k=None):
     if hasattr(app, "retrieve"):
-        return app.retrieve(vector_db, question)
-    return vector_db.similarity_search(question, k=3, filter={"is_latest": True})
+        try:
+            return app.retrieve(vector_db, question, top_k=k)
+        except TypeError:                           # older app.py without top_k
+            return app.retrieve(vector_db, question)
+    return vector_db.similarity_search(question, k=k or 3, filter={"is_latest": True})
+
+
+def answer_k():
+    """How many sources the CHATBOT gives the LLM (3, or 5 with the re-ranker)."""
+    return app.top_k_for(USE_RERANK) if hasattr(app, "top_k_for") else 3
 
 
 def generate_answer(question, results):
@@ -165,7 +185,37 @@ def run_label():
     parts = [CHUNK_STRATEGY]
     parts += [name for name, on in (("hybrid", USE_HYBRID), ("rerank", USE_RERANK),
                                     ("rewrite", USE_REWRITE)) if on]
+    if getattr(app, "SEARCH_SCOPE", "all") != "all":
+        parts.append(app.SEARCH_SCOPE)
+    if MIN_RELEVANCE:
+        parts.append(f"cutoff{MIN_RELEVANCE}")
     return "+".join(parts)
+
+
+def test_file():
+    return next((p for p in TEST_FILES if p.exists()), None)
+
+
+def run_settings(vector_db):
+    """Day 4 #2: everything needed to tell runs apart later."""
+    path = test_file()
+    chat_model = (getattr(app, "HF_MODEL", "") if getattr(app, "LLM_PROVIDER", "") == "huggingface"
+                  else getattr(app, "CHAT_MODEL", ""))
+    return {
+        "strategy": CHUNK_STRATEGY,
+        "hybrid": USE_HYBRID, "rerank": USE_RERANK, "rewrite": USE_REWRITE,
+        "scope": getattr(app, "SEARCH_SCOPE", "all"),
+        "eval_k": EVAL_K, "answer_k": answer_k(),
+        "chunk_size": getattr(app, "CHUNK_SIZE", ""), "chunk_overlap": getattr(app, "CHUNK_OVERLAP", ""),
+        "db_version": getattr(app, "DB_VERSION", ""),
+        "chunks_in_db": vector_db._collection.count(),
+        "embed_model": getattr(app, "EMBED_MODEL", ""),
+        "chat_model": f"{getattr(app, 'LLM_PROVIDER', 'ollama')}:{chat_model}",
+        "min_relevance": MIN_RELEVANCE,
+        "include_annual_reports": getattr(app, "INCLUDE_ANNUAL_REPORTS", ""),
+        "test_file": path.name if path else "",
+        "test_file_md5": hashlib.md5(path.read_bytes()).hexdigest()[:8] if path else "",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -175,9 +225,10 @@ def run_label():
 def run_questions(vector_db, cases):
     details = []
     for n, case in enumerate(cases, start=1):
-        docs = retrieve(vector_db, case["question"])
-        answer = generate_answer(case["question"], docs) if docs else "I could not find this in the documents."
-        row = {"case": case, "docs": docs, "answer": answer}
+        docs = retrieve(vector_db, case["question"], k=EVAL_K)        # scored at the SAME k
+        used = docs[:answer_k()]                                      # what the chatbot answers from
+        answer = generate_answer(case["question"], used) if used else "I could not find this in the documents."
+        row = {"case": case, "docs": docs, "used": used, "answer": answer}
         try:
             row["score"] = top_relevance(vector_db, case["question"])   # for the cut-off advice
         except Exception:
@@ -197,15 +248,24 @@ def run_questions(vector_db, cases):
 
 
 def suggest_cutoff(details):
-    """MIN_RELEVANCE advice: real questions should score ABOVE it, no_answer ones BELOW."""
-    real = [d["score"] for d in details if d["case"]["type"] != "no_answer" and d.get("score") is not None]
-    none = [d["score"] for d in details if d["case"]["type"] == "no_answer" and d.get("score") is not None]
+    """MIN_RELEVANCE advice: real questions should score ABOVE it, no_answer ones BELOW.
+    Day 4 #3: tuned on the DEV half only (questions 1, 3, 5, ...). The other half is
+    untouched, so judge the cut-off on it: a cut-off tuned on the questions you score
+    makes the results look better than they are."""
+    dev = details[0::2]
+    real = [d["score"] for d in dev if d["case"]["type"] != "no_answer" and d.get("score") is not None]
+    none = [d["score"] for d in dev if d["case"]["type"] == "no_answer" and d.get("score") is not None]
     if not real or not none:
         return None
     lowest_real, highest_none = min(real), max(none)
     if highest_none < lowest_real:
-        return (f"  Suggested MIN_RELEVANCE  : {(highest_none + lowest_real) / 2:.2f}  "
-                f"(no_answer max {highest_none:.2f} < real min {lowest_real:.2f}: clean cut)")
+        cut = (highest_none + lowest_real) / 2
+        held = details[1::2]                                       # never used for tuning
+        ok = sum(1 for d in held if d.get("score") is not None
+                 and (d["score"] >= cut) == (d["case"]["type"] != "no_answer"))
+        return (f"  Suggested MIN_RELEVANCE  : {cut:.2f}  (tuned on the dev half: no_answer max "
+                f"{highest_none:.2f} < real min {lowest_real:.2f})\n"
+                f"  ...on the other half     : {ok}/{len(held)} questions on the right side of {cut:.2f}")
     return (f"  MIN_RELEVANCE advice     : no clean cut (no_answer max {highest_none:.2f}, "
             f"real min {lowest_real:.2f}). Keep 0 and let the LLM refuse.")
 
@@ -215,7 +275,9 @@ def score(details):
     no_answer = [d for d in details if d["case"]["type"] == "no_answer"]
     s = {"answerable": len(answerable), "no_answer": len(no_answer)}
     if answerable:
-        s["hit_rate"] = sum(1 for d in answerable if d["rank"]) / len(answerable)
+        for k in (1, 3):
+            s[f"hit@{k}"] = sum(1 for d in answerable if d["rank"] and d["rank"] <= k) / len(answerable)
+        s["hit_rate"] = sum(1 for d in answerable if d["rank"]) / len(answerable)   # hit@EVAL_K
         s["mrr"] = sum(1 / d["rank"] for d in answerable if d["rank"]) / len(answerable)
         s["doc_hit_rate"] = sum(1 for d in answerable if d["doc_rank"]) / len(answerable)
         s["by_type"] = {}
@@ -238,13 +300,13 @@ def score_ragas(details):
     from ragas.embeddings import LangchainEmbeddingsWrapper
 
     samples = [{"user_input": d["case"]["question"], "response": d["answer"],
-                "retrieved_contexts": [doc.page_content for doc in d["docs"]],
+                "retrieved_contexts": [doc.page_content for doc in d["used"]],
                 "reference": d["case"]["answer"]}
                for d in details if d["case"]["type"] != "no_answer" and d["docs"]]
     result = evaluate(
         dataset=EvaluationDataset.from_list(samples),
         metrics=[Faithfulness(), ResponseRelevancy()],
-        llm=LangchainLLMWrapper(llm),                       # your CHAT_MODEL grades the answers
+        llm=LangchainLLMWrapper(llm),                       # Day 4 #4: the SAME model grades its answers
         embeddings=LangchainEmbeddingsWrapper(embeddings),
         run_config=RunConfig(max_workers=2, timeout=300),   # gentle: avoids port errors
     )
@@ -283,26 +345,96 @@ def save_details(label, details, ragas_df=None):
     return path
 
 
-def save_summary(label, s, faithfulness="", relevance=""):
+SUMMARY_COLUMNS = ["time", "setup", "questions", "hit@1", "hit@3", "hit@k", "mrr@k", "doc_hit@k",
+                   "no_answer_acc", "faithfulness", "answer_relevance", "ragas_judge"]
+
+
+def save_summary(label, s, settings, faithfulness="", relevance=""):
+    """Day 4 #2: one row per run, WITH its settings, so runs can be told apart later."""
+    header = SUMMARY_COLUMNS + list(settings)
+    if RESULTS_FILE.exists():
+        with RESULTS_FILE.open(encoding="utf-8-sig") as f:
+            old_header = next(csv.reader(f), [])
+        if old_header != header:                       # old format: keep it, start a new file
+            old = RESULTS_FILE.with_name(f"eval_results_old_{datetime.now():%Y%m%d_%H%M}.csv")
+            RESULTS_FILE.rename(old)
+            print(f"(old eval_results.csv had other columns: kept as {old.name})")
     new_file = not RESULTS_FILE.exists()
     fmt = lambda x: f"{x:.3f}" if isinstance(x, float) else x
     with RESULTS_FILE.open("a", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
         if new_file:
-            w.writerow(["time", "setup", "questions", "hit_rate", "mrr", "doc_hit_rate",
-                        "no_answer_acc", "faithfulness", "answer_relevance"])
+            w.writerow(header)
         w.writerow([datetime.now().strftime("%Y-%m-%d %H:%M"), label,
-                    s["answerable"] + s["no_answer"], fmt(s.get("hit_rate", "")),
-                    fmt(s.get("mrr", "")), fmt(s.get("doc_hit_rate", "")),
-                    fmt(s.get("no_answer_acc", "")), fmt(faithfulness), fmt(relevance)])
+                    s["answerable"] + s["no_answer"], fmt(s.get("hit@1", "")), fmt(s.get("hit@3", "")),
+                    fmt(s.get("hit_rate", "")), fmt(s.get("mrr", "")), fmt(s.get("doc_hit_rate", "")),
+                    fmt(s.get("no_answer_acc", "")), fmt(faithfulness), fmt(relevance),
+                    settings["chat_model"] if faithfulness != "" else ""]
+                   + [settings[c] for c in settings])
+
+
+def write_report():
+    """Day 5: the evidence. eval_report.md = every run, and the change against the baseline
+    (same strategy, no hybrid / rerank / rewrite) of the same k and test file."""
+    if not RESULTS_FILE.exists():
+        sys.exit("No eval_results.csv yet: run eval.py first.")
+    with RESULTS_FILE.open(encoding="utf-8-sig") as f:
+        rows = list(csv.DictReader(f))
+    if not rows or "hit@k" not in rows[0]:
+        sys.exit("eval_results.csv is in the old format: run the evals again with this eval.py.")
+    latest = {}
+    for r in rows:                                     # last run of each setup wins
+        latest[(r["setup"], r["eval_k"], r["test_file_md5"])] = r
+
+    def base_of(r):
+        for b in latest.values():
+            if (b["strategy"] == r["strategy"] and b["eval_k"] == r["eval_k"]
+                    and b["test_file_md5"] == r["test_file_md5"] and b["scope"] == r["scope"]
+                    and b["hybrid"] == b["rerank"] == b["rewrite"] == "False"
+                    and b["min_relevance"] in ("0", "0.0")):
+                return b
+        return None
+
+    def cell(r, col, base):
+        v = r.get(col, "")
+        if not v or base is None or base is r or not base.get(col):
+            return v
+        d = float(v) - float(base[col])
+        return f"{v} ({d:+.3f})"
+
+    k = rows[-1]["eval_k"]
+    lines = ["# Evaluation results", "",
+             f"All setups scored at the same k = {k} on `{rows[-1]['test_file']}` "
+             f"(md5 {rows[-1]['test_file_md5']}). In brackets: change vs. the baseline of the same "
+             f"chunking strategy (no hybrid / re-rank / rewrite, no cut-off).", "",
+             "| Setup | Hit@1 | Hit@3 | Hit@k | MRR@k | Doc hit@k | No-answer refused | Faithfulness | Answer relevance |",
+             "|---|---|---|---|---|---|---|---|---|"]
+    for r in sorted(latest.values(), key=lambda r: (r["strategy"], r["setup"])):
+        b = base_of(r)
+        lines.append("| " + " | ".join([r["setup"]] + [cell(r, c, b) for c in
+                     ("hit@1", "hit@3", "hit@k", "mrr@k", "doc_hit@k", "no_answer_acc",
+                      "faithfulness", "answer_relevance")]) + " |")
+    judges = {r["ragas_judge"] for r in latest.values() if r.get("ragas_judge")}
+    if judges:
+        lines += ["", f"Note: faithfulness and answer relevance were graded by {', '.join(sorted(judges))}, "
+                      "the same model that writes the answers. A small model grading itself can be "
+                      "too generous, so treat these two scores as rough."]
+    lines += ["", "Settings of each run (chunk size, models, cut-off, test file) are in eval_results.csv."]
+    Path("eval_report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print("\n".join(lines))
+    print("\nSaved: eval_report.md")
 
 
 if __name__ == "__main__":
+    if "--report" in sys.argv:
+        write_report()
+        sys.exit()
     cases = load_cases()
     label = run_label()
     print(f"Setup: {label}\n")
 
     vector_db = get_vector_db()
+    settings = run_settings(vector_db)
     details = run_questions(vector_db, cases)
     s = score(details)
 
@@ -314,10 +446,12 @@ if __name__ == "__main__":
 
     print("\n" + "=" * 55)
     print(f"  Setup                  : {label}")
+    print(f"  Scored at k            : {EVAL_K} for every setup (the chatbot answers from {answer_k()})")
     if "hit_rate" in s:
-        print(f"  Hit-rate @3 (page)     : {s['hit_rate']:.3f}   ({s['answerable']} questions)")
-        print(f"  MRR                    : {s['mrr']:.3f}")
-        print(f"  Right document found   : {s['doc_hit_rate']:.3f}")
+        print(f"  Hit@1 / Hit@3 (page)   : {s['hit@1']:.3f} / {s['hit@3']:.3f}")
+        print(f"  Hit@{EVAL_K} (page)           : {s['hit_rate']:.3f}   ({s['answerable']} questions)")
+        print(f"  MRR@{EVAL_K}                  : {s['mrr']:.3f}")
+        print(f"  Right document @{EVAL_K}      : {s['doc_hit_rate']:.3f}")
         for t, (hits, total) in s["by_type"].items():
             print(f"     {t:<20}: {hits}/{total}")
     if "no_answer_acc" in s:
@@ -325,11 +459,13 @@ if __name__ == "__main__":
     if faithfulness != "":
         print(f"  Faithfulness           : {faithfulness:.3f}")
         print(f"  Answer relevance       : {relevance:.3f}")
+        print(f"  (graded by {settings['chat_model']}, the same model that wrote the answers:"
+              f" treat as rough)")
     advice = suggest_cutoff(details)
     if advice:
         print(advice + (f"   [now: {MIN_RELEVANCE}]" if MIN_RELEVANCE else ""))
     print("=" * 55)
 
-    save_summary(label, s, faithfulness, relevance)
+    save_summary(label, s, settings, faithfulness, relevance)
     details_file = save_details(label, details, ragas_df)
     print(f"Saved: {RESULTS_FILE} (summary) and {details_file} (every question)")

@@ -103,8 +103,14 @@ import hashlib
 # ===========================================================================
 
 HEADER_FOOTER_ZONE = 0.08    # top/bottom 8% of the page = header/footer zone
+FRAME_ZONE = 0.15            # booklet page frames (title bar, web address) sit a bit lower: 15%
+FRAME_LINE_CHARS = 80        # ...and are short lines
 REPEAT_THRESHOLD = 0.5       # repeated on >= 50% of pages -> header/footer
 HEADING_SIZE_RATIO = 1.15    # font >= 1.15 x body size -> heading
+MAX_HEADING_CHARS = 150      # a longer "heading" is really a paragraph in a big font
+FRAME_PAGE_SHARE = 0.6       # a "table" covering 60%+ of the page is a decorative page frame
+PROSE_CELL_CHARS = 100       # cells this long on average = paragraphs in boxes, not a data table
+MAX_HEADER_CELL = 60         # a real column header is short ("Max balance"), not a sentence
 
 FOOTNOTE_SIZE_RATIO = 0.9    # footnotes use a smaller font than body text
 FOOTNOTE_ZONE = 0.6          # ...and sit in the bottom 40% of the page
@@ -124,7 +130,12 @@ METADATA_HEAD_CHARS = 4000   # roughly the first page
 
 # Incremental runs: change this number whenever you change the CLEANING code.
 # Every PDF cleaned with an older number is cleaned again once.
-PIPELINE_VERSION = "1.3"   # 1.2 = page_end, 1.3 = cover IDs, doc types, safe dates, stale output, table symbols
+PIPELINE_VERSION = "1.8"   # 1.2 = page_end, 1.3 = cover IDs, doc types, safe dates, stale output, table symbols
+                           # 1.5 = page frames / prose boxes are not tables; safer cross-page merge
+                           # 1.6 = good titles: no letterhead, stamp, watermark, date, number, "Annexure"
+                           # 1.7 = doc types: annual reports detected; "business model Our" is not a manual
+                           # 1.8 = supersedes = circular numbers / dated references only; FAQ doc type
+                           # 1.4 = infographics: numbers are not headings, long "headings" are text
 
 TOC_WORDS = re.compile(r"^\s*(table of contents|contents|index)\s*$", re.I)
 REFERENCE_WORDS = re.compile(r"^\s*(references|bibliography|works cited|sources)\s*$", re.I)
@@ -170,6 +181,13 @@ SUPERSEDES = re.compile(
     r"((?:No\.|Nos\.|\.(?=\S)|[^.\n]){1,200})", re.I)     # keep "No." and "21.04.048"
 
 # Fix A1: a short page that holds an ID (model no., version, RBI ref) is never dropped
+# Fix: "supersedes" keeps ONLY real references, never a sentence fragment
+DEPT_REF_NO = re.compile(      # DBR.BP.BC.No.45/21.04.048/2024-25, DOR.CRE.REC.12/03.10.001/2025-26
+    r"\b[A-Z]{2,6}(?:\.[A-Za-z]{1,10}){1,6}\.?\s?(?:No\.?\s?)?\d+/[\d.]+/\d{4}-\d{2,4}\b")
+DATED_REF = re.compile(        # "circular ... dated July 1, 2019", "Master Direction dated 25.02.2016"
+    r"\b(?:circular|master\s+circular|direction|master\s+direction|notification|letter|guidelines|instructions)"
+    r"\b[^.;]{0,150}?\bdated\s+" + DATE_VALUE, re.I)
+
 IDENTIFIER = re.compile(
     r"\b(?:[A-Z]{1,6}-[A-Z0-9]{2,}[A-Z0-9-]*"          # AP-X200, SM-G991B
     r"|[A-Z]{2,6}\d{2,}[A-Z0-9]*"                      # XR500, KDL40W
@@ -177,20 +195,36 @@ IDENTIFIER = re.compile(
     r"|RBI/(?:[A-Za-z]{2,10}/)*\d{4}-\d{2}/\d+)\b")   # RBI/2024-25/12, RBI/DOR/2025-26/151
 
 # Fix A2: document types. Each type says how to detect it and which fields it must have.
-DOC_TYPES = {
+DOC_TYPES = {                  # checked in this order; the first match wins
+    "annual_report": {         # "Annual Report 2025-26", "Annual Report FY2026", "annual report for the year 2025"
+        "detect": re.compile(r"\b(?:integrated\s+)?annual\s+report\b\s*(?:for\s+the\s+(?:financial\s+)?year\s*)?"
+                             r"(?:FY\s*)?[\d]{2,4}(?:\s*[-–/]\s*\d{2,4})?"
+                             r"|\b(?:audited|unaudited)\s+(?:standalone\s+|consolidated\s+)?financial\s+results\b",
+                             re.I),
+        "required": [],
+    },
+    "faq": {                   # FAQs are not circulars: no circular number / date needed
+        "detect": re.compile(r"\bFrequently\s+Asked\s+Questions\b|\bFAQs?\b", re.I),
+        "required": [],
+    },
     "rbi_circular": {
         "detect": re.compile(r"Reserve Bank of India|\bRBI/(?:[A-Za-z]{2,10}/)*\d{4}-\d{2}/\d+"
                              r"|Master Direction", re.I),
         "required": ["circular_no", "issue_date"],
     },
     "manual": {
+        # "User Manual", or a LABELLED model code WITH a digit: "Model No: AP-X200", "Model: X200".
+        # ("business model Our ..." is NOT a manual: no label, no digit.)
         "detect": re.compile(r"\b(?:user|owner'?s|installation|service|operating|instruction)\s+"
-                             r"(?:manual|guide)\b|\bmodel\s*(?:no\.?|number)?\s*[:\-]?\s*[A-Z0-9]", re.I),
+                             r"(?:manual|guide)\b"
+                             r"|\bmodel\s*(?:no\.?|number|#|[:\-])\s*[:\-]?\s*[A-Z]{0,6}[-/]?[A-Z]*\d[A-Z0-9\-/]*",
+                             re.I),
         "required": ["model"],
     },
 }
 MODEL_NO = re.compile(r"\bModel\s*(?:No\.?|Number)?\s*[:\-]?\s*"
-                      r"([A-Z0-9]+(?:[-/][A-Z0-9]+)+|[A-Z]{1,6}\d{2,}[A-Z0-9]*)", re.I)
+                      r"((?=[A-Z0-9/-]*\d)[A-Z0-9]+(?:[-/][A-Z0-9]+)+|[A-Z]{1,6}\d{2,}[A-Z0-9]*)", re.I)
+                                                # a model code always has a digit
 DOC_VERSION = re.compile(r"\b(?:v|ver\.?|version|rev(?:ision)?\.?)\s*(\d+(?:\.\d+)*)\b", re.I)
 PRODUCT_NAME = re.compile(r"^[#\s]*(.{3,80}?)\s*[|\-:]?\s*\b(?:user|owner'?s|installation|service|"
                           r"operating|instruction)\s+(?:manual|guide)\b", re.I | re.M)
@@ -318,8 +352,13 @@ def merge_lone_markers(lines):
 # Step 2 (Element 7): headers and footers
 # ===========================================================================
 
-def in_header_footer_zone(bbox, page_height) -> bool:
-    return bbox[3] < page_height * HEADER_FOOTER_ZONE or bbox[1] > page_height * (1 - HEADER_FOOTER_ZONE)
+def in_header_footer_zone(bbox, page_height, zone=HEADER_FOOTER_ZONE) -> bool:
+    return bbox[3] < page_height * zone or bbox[1] > page_height * (1 - zone)
+
+
+def in_frame_zone(line, page_height) -> bool:
+    """Short line in the top/bottom 15%: may be a repeated page frame ("Office of RBI Ombudsman")."""
+    return len(line["text"]) <= FRAME_LINE_CHARS and in_header_footer_zone(line["bbox"], page_height, FRAME_ZONE)
 
 
 def find_headers_footers(doc, pages):
@@ -327,16 +366,17 @@ def find_headers_footers(doc, pages):
     counter = Counter()
     for page, lines in zip(doc, pages):
         counter.update({digits_to_hash(ln["text"]) for ln in lines
-                        if in_header_footer_zone(ln["bbox"], page.rect.height)})
+                        if in_frame_zone(ln, page.rect.height)})
     min_pages = max(2, int(len(pages) * REPEAT_THRESHOLD))
     return {key for key, n in counter.items() if n >= min_pages}
 
 
 def is_header_footer(line, page_height, repeated) -> bool:
-    if not in_header_footer_zone(line["bbox"], page_height):
+    if not in_frame_zone(line, page_height):
         return False
     key = digits_to_hash(line["text"])
-    if re.fullmatch(r"[\-\s]*(page\s*)?#(\s*of\s*#)?[\-\s]*", key):   # bare page numbers
+    if in_header_footer_zone(line["bbox"], page_height) and \
+            re.fullmatch(r"[\-\s]*(page\s*)?#(\s*of\s*#)?[\-\s]*", key):   # bare page numbers
         return True
     return key in repeated
 
@@ -372,9 +412,29 @@ def font_statistics(pages):
     return body, {s: min(i + 1, 3) for i, s in enumerate(big)}
 
 
+# Infographics: "38%", "~14%", "₹6,933 crores", "2.3x", "Rs 450 cr" are big numbers, NOT headings
+NUMBER_ONLY = re.compile(
+    r"^\s*[^\w\s]*\s*(?:rs\.?|inr|usd|us\$)?\s*[^\w\s]*\s*\d[\d.,]*\s*"
+    r"(?:%|per\s*cent|crores?|cr\.?|lakhs?|lacs?|bn|billion|mn|million|thousand|k|x|times|bps)?\s*[)+]*\s*$",
+    re.I)
+
+
+def looks_like_heading_text(text) -> bool:
+    """A heading needs real words: at least one word of 3+ letters, and not just a number."""
+    return bool(re.search(r"[A-Za-z]{3,}", text)) and not NUMBER_ONLY.match(text)
+
+
+def sentence_like(text) -> bool:
+    """'In 2021, under the oversight of the Board, the bank expanded ...' is a sentence:
+    headings almost never have 10+ small (lower-case) words."""
+    return len(re.findall(r"\b[a-z][a-z]+\b", text)) >= 10
+
+
 def font_heading_level(line, levels) -> int:
     text = line["text"]
     if len(text) > 120 or (text.endswith((".", ",", ";")) and len(text) > 60):
+        return 0
+    if not looks_like_heading_text(text):            # "38%", "₹6,933 crores" -> normal text
         return 0
     if line["size"] in levels:
         return levels[line["size"]]
@@ -485,7 +545,27 @@ def table_rows_as_text(rows):
     'Account type: Small account; Max balance: Rs 50,000'.
     Embeddings match these far better than a Markdown grid."""
     header = rows[0]
-    return ["; ".join(f"{h}: {v}" for h, v in zip(header, r) if v) for r in rows[1:]]
+    if any(len(h) > MAX_HEADER_CELL for h in header):          # not a real header: no labels
+        return ["; ".join(v for v in r if v) for r in rows]
+    return ["; ".join(f"{h}: {v}" if h and h != v else v for h, v in zip(header, r) if v)
+            for r in rows[1:]]
+
+
+def is_data_table(rows, bbox, page_w, page_h) -> bool:
+    """False for things pdfplumber calls a table but are not:
+      - a page FRAME (border around the whole page, e.g. booklets with a title bar)
+      - PROSE in boxes (cells full of sentences, not short values)
+      - a header row that is a sentence or a URL"""
+    x0, top, x1, bottom = bbox
+    if (x1 - x0) * (bottom - top) >= FRAME_PAGE_SHARE * page_w * page_h:
+        return False                                          # covers most of the page: a frame
+    cells = [c for r in rows for c in r if c.strip()]
+    if not cells or sum(len(c) for c in cells) / len(cells) > PROSE_CELL_CHARS:
+        return False                                          # paragraphs, not values
+    header = [c for c in rows[0] if c.strip()]
+    if any(len(c) > MAX_HEADER_CELL or re.search(r"https?://|www\.", c) for c in header):
+        return False                                          # header is a sentence / web address
+    return True
 
 
 def extract_tables(pdf_path):
@@ -497,7 +577,8 @@ def extract_tables(pdf_path):
             for t in page.find_tables():
                 rows = clean_table(t.extract())
                 # 1 row or 1 column is not a real table (often a framed text box)
-                if len(rows) >= 2 and len(rows[0]) >= 2:
+                if len(rows) >= 2 and len(rows[0]) >= 2 and is_data_table(
+                        rows, t.bbox, float(page.width), float(page.height)):
                     found.append({"bbox": tuple(t.bbox), "rows": rows})
             # Element 13: a table found INSIDE another table is a nested table;
             # its text is already in the outer table's cell, so drop it
@@ -530,9 +611,14 @@ def merge_tables_across_pages(sections):
             prev = next((m for m in reversed(merged) if m["type"] in content), None)
             first_on_page = not any(m["page"] == s["page"] and m["type"] in content
                                     for m in merged)
+            same_header = s["rows"][0] == prev["rows"][0] if prev and prev["type"] == "table" else False
+            looks_continued = (prev and prev["type"] == "table"
+                               and not any(re.search(r"[A-Za-z]{3,}", c) and not re.search(r"\d", c)
+                                           for c in s["rows"][0]))   # B starts with data, not a header
             if (prev and prev["type"] == "table" and first_on_page
                     and prev["pages"][-1] == s["page"] - 1
-                    and len(prev["rows"][0]) == len(s["rows"][0])):
+                    and len(prev["rows"][0]) == len(s["rows"][0])
+                    and (same_header or looks_continued)):
                 rows = s["rows"]
                 if rows[0] == prev["rows"][0]:
                     rows = rows[1:]                  # repeated header row
@@ -1012,7 +1098,12 @@ def parse_pdf(pdf_path: Path, use_bookmarks=True):
                                 or HEADING_NUMBER.match(nxt["text"])):   # "1. Intro" = new heading
                             break
                         text, used, last = text + " " + nxt["text"], used + 1, nxt
-                    heading = (lvl, text, used)
+                    if len(text) <= MAX_HEADING_CHARS and not sentence_like(text):
+                        heading = (lvl, text, used)
+                    else:                                          # a paragraph in a big font: text
+                        buffer.extend(items[i:i + used])
+                        i += used
+                        continue
 
             if heading:
                 level, text, used = heading
@@ -1419,6 +1510,8 @@ def find_circular_no(head: str):
 def detect_doc_type(head: str) -> str:
     """Fix A2: first type in DOC_TYPES whose pattern is found on page 1."""
     for doc_type, rule in DOC_TYPES.items():
+        if doc_type == "faq" and RBI_REF_NO.search(head):
+            continue                      # a circular that only MENTIONS FAQs stays a circular
         if rule["detect"].search(head):
             return doc_type
     return "general"
@@ -1469,10 +1562,7 @@ def extract_version_metadata(text: str) -> dict:
     manual = (extract_manual_metadata(head) if doc_type == "manual"
               else {"model": None, "product": None, "brand": None, "doc_version": None})
 
-    supersedes = None
-    m = SUPERSEDES.search(text)            # whole text: often in the last paragraph
-    if m:
-        supersedes = m.group(1).strip()
+    supersedes = find_supersedes(text)     # whole text: often in the last paragraph
 
     return {
         "doc_type": doc_type,
@@ -1484,6 +1574,25 @@ def extract_version_metadata(text: str) -> dict:
         "superseded_by": None,
         "is_latest": True,
     }
+
+
+def find_supersedes(text: str):
+    """References after 'supersedes / replaces / in supersession of' -- ONLY:
+       - RBI numbers:        RBI/2019-20/45
+       - department numbers: DBR.BP.BC.No.45/21.04.048/2024-25
+       - dated references:   'circular ... dated July 1, 2019' -> 'dated 2019-07-01'
+    A fragment like 'earlier orders' gives nothing. Returns '; '-joined refs or None."""
+    refs = []
+    for m in SUPERSEDES.finditer(text):
+        part = m.group(1)
+        found = RBI_REF_NO.findall(part) + DEPT_REF_NO.findall(part)
+        if not found:
+            for d in DATED_REF.finditer(m.group(0)):
+                iso = to_iso_date(d.group(1))
+                if iso:
+                    found.append(f"dated {iso}")
+        refs += [r for r in found if r not in refs]
+    return "; ".join(refs) or None
 
 
 def norm_ref(text: str) -> str:
@@ -1515,20 +1624,21 @@ def link_superseded(json_dir: Path) -> int:
         meta["superseded_by"] = None
         meta["is_latest"] = not meta.get("stamp")      # Element 23: stamped = not latest
 
-    by_no = {}
-    for path, d in docs.items():
-        no = norm_ref(d["metadata"].get("circular_no"))
-        if len(no) >= 4:                   # too-short numbers would match everything
-            by_no[no] = path
-
     links = 0
     for new_path, new_doc in docs.items():
         new_meta = new_doc["metadata"]
         target = norm_ref(new_meta.get("supersedes"))
         if not target:
             continue
-        for no, old_path in by_no.items():
-            if old_path == new_path or no not in target:
+        dates = set(re.findall(r"dated (\d{4}-\d{2}-\d{2})", new_meta.get("supersedes") or ""))
+        for old_path, old_doc in docs.items():
+            if old_path == new_path:
+                continue
+            no = norm_ref(old_doc["metadata"].get("circular_no"))
+            by_number = len(no) >= 4 and no in target
+            by_date = (old_doc["metadata"].get("issue_date") in dates
+                       and old_doc["metadata"].get("doc_type") == new_meta.get("doc_type"))
+            if not (by_number or by_date):
                 continue
             old_meta = docs[old_path]["metadata"]
             # safety: the "old" one must not be newer than the one replacing it
@@ -1698,15 +1808,40 @@ def prepare_pdf(pdf_path: Path, work_dir: Path):
     finally:
         doc.close()
 
-    if scanned and shutil.which("ocrmypdf"):
+    if scanned and not missing_ocr_tools():
         out = work_dir / ("ocr_" + pdf_path.name)
-        run = subprocess.run(["ocrmypdf", "--skip-text", "--quiet", str(path), str(out)],
+        run = subprocess.run(ocr_command() + ["--skip-text", "--quiet", str(path), str(out)],
                              capture_output=True, text=True)
+        if run.returncode != 0:
+            print(f"          OCR failed for {pdf_path.name}: {(run.stderr or '').strip()[:300]}")
         if run.returncode == 0:
             final = work_dir / pdf_path.name
             out.replace(final)
             path, info["ocr_done"] = final, True
     return path, info
+
+def ocr_command():
+    """'ocrmypdf' on PATH, or 'python -m ocrmypdf' when it is only pip-installed in the venv."""
+    if shutil.which("ocrmypdf"):
+        return ["ocrmypdf"]
+    import importlib.util
+    if importlib.util.find_spec("ocrmypdf"):
+        import sys
+        return [sys.executable, "-m", "ocrmypdf"]
+    return []
+
+
+def missing_ocr_tools():
+    """Which OCR tools are not installed: ocrmypdf (pip), Tesseract and Ghostscript (system)."""
+    missing = []
+    if not ocr_command():
+        missing.append("ocrmypdf  (pip install ocrmypdf)")
+    if not shutil.which("tesseract"):
+        missing.append("Tesseract (see README: OCR setup)")
+    if not any(shutil.which(g) for g in ("gs", "gswin64c", "gswin32c")):
+        missing.append("Ghostscript (see README: OCR setup)")
+    return missing
+
 
 
 def inspect_pages(doc):
@@ -1857,6 +1992,69 @@ def fix_section_text(sections, watermarks):
     return [s for s in sections if s["text"].strip()], stats
 
 
+# ---------------------------------------------------------------------------
+# Document title: never a letterhead, stamp, watermark, date, number or label
+# ---------------------------------------------------------------------------
+
+SUBJECT_LINE = re.compile(r"^\s*(?:sub(?:ject)?|re)\s*[:.\-–]\s*(.{8,200})$", re.I | re.M)
+LETTERHEAD = re.compile(       # "Reserve Bank of India", "RBI - Central Office - Mumbai", "www.rbi.org.in"
+    r"^\s*(?:reserve\s+bank\s+of\s+india|rbi|www\.rbi\.org\.in)\b"
+    r"(?:[\s,\-–/]*(?:central\s+office|head\s+office|mumbai|new\s+delhi|india"
+    r"|(?:[A-Za-z&]+\s+){0,4}department(?:\s+of\s+[A-Za-z&\s]+)?|website[:\s]*\S*|\S+\.(?:in|org)\S*))*\s*$", re.I)
+LABEL_ONLY = re.compile(
+    r"^\s*(?:annex(?:ure)?|appendix|schedule|attachment|exhibit|enclosure|table\s+of\s+contents"
+    r"|contents|index|preface|foreword|notification|circular|press\s+release|draft|page)"
+    r"\b[\s\-–.:]*(?:[IVXLC]+|[A-Z]|\d+)?[\s?.:]*$", re.I)
+
+
+def bad_title(text, watermarks=()) -> str:
+    """Why this text cannot be a title ('' = it is fine)."""
+    text = (text or "").strip(" #*>-–:|\t")
+    letters = [c for c in text if c.isalpha()]
+    if len(re.findall(r"[A-Za-z]{3,}", text)) < 2 and not LABEL_ONLY.match(text):
+        if not letters or sum(1 for c in letters if c.isascii()) / len(letters) < 0.7:
+            return "not English / garbled"                    # Hindi letterhead, broken font
+        return "too few words"                                # "~14%", "schedule?"
+    if letters and sum(1 for c in letters if c.isascii()) / len(letters) < 0.7:
+        return "not English / garbled"
+    if GARBAGE.search(text) or PRIVATE_USE.search(text):
+        return "broken characters"
+    if STAMP_WORDS.fullmatch(text.strip(" .!")) or (STAMP_WORDS.search(text) and len(text.split()) <= 3):
+        return "stamp"                                        # "Withdrawn"
+    if any(w and w.lower() in text.lower() and len(text) <= len(w) + 10 for w in watermarks):
+        return "watermark"
+    if ANY_DATE.search(text) and len(re.findall(r"[A-Za-z]{3,}", re.sub(DATE_VALUE, "", text))) < 2:
+        return "date"                                         # "June 05, 2026"
+    if LABEL_ONLY.match(text):
+        return "label"                                        # "ANNEXURE- I", "Schedule?"
+    if LETTERHEAD.match(text):
+        return "letterhead"                                   # same on every RBI document
+    if text.endswith("?") and len(text.split()) <= 4:
+        return "question fragment"
+    if len(text) > 200:
+        return "too long"
+    return ""
+
+
+def title_from_file_name(path: Path) -> str:
+    """'RBI (Payments Banks)Direction' -> 'RBI (Payments Banks) Direction'."""
+    name = re.sub(r"[_]+|(?<=\w)-(?=\w)", " ", path.stem)
+    name = re.sub(r"\)(?=\w)", ") ", name)
+    return re.sub(r"\s{2,}", " ", name).strip()
+
+
+def choose_title(parsed, sections, pdf_path: Path, watermarks):
+    """First GOOD candidate: subject line, title found by the parser, headings, file name."""
+    candidates = [m.group(1) for m in SUBJECT_LINE.finditer(parsed.get("original_head", ""))][:1]
+    candidates.append(parsed.get("title", ""))
+    candidates += [s["text"].lstrip("# ").strip() for s in sections if s["type"] == "heading"][:15]
+    for c in candidates:
+        c = re.sub(r"\s+", " ", c or "").strip(" #*>-–:|")
+        if c and not bad_title(c, watermarks):
+            return c[:200]
+    return title_from_file_name(pdf_path)
+
+
 def extra_cleaning(parsed, pdf_path: Path, prep: dict):
     """Elements 18-27: one call after parse_pdf(). Order:
       1. keep the first page text for the version metadata (element 31)
@@ -1896,8 +2094,14 @@ def extra_cleaning(parsed, pdf_path: Path, prep: dict):
     stats.update(st)
     kept, st = fix_section_text(kept, report["watermarks"])
     stats.update(st)
+    old_title = parsed["title"]
+    parsed["title"] = choose_title(parsed, kept, pdf_path, report["watermarks"])
+    if parsed["title"] != old_title:
+        stats["title_replaced"] += 1
     for s in kept:
-        s["heading_path"] = s.get("heading_path") or parsed["title"]
+        parts = [p for p in (s.get("heading_path") or "").split(" > ") if p]
+        parts = [p for p in parts if not bad_title(p, report["watermarks"])]   # no stamp/date/letterhead
+        s["heading_path"] = " > ".join(parts) or parsed["title"]
 
     # 5. form fields, one section per page
     by_page = defaultdict(list)
@@ -2149,9 +2353,9 @@ def main():
         print(f"          cleaning: {parsed['cleaning_stats']}")
         q = parsed.get("page_quality", {})
         if q.get("ocr_needed_pages"):
-            print(f"          WARNING: pages {q['ocr_needed_pages']} need OCR "
-                  f"(scanned or broken text) - install ocrmypdf, or run: "
-                  f"ocrmypdf --skip-text {pdf.name} out.pdf")
+            missing = missing_ocr_tools()
+            print(f"          WARNING: pages {q['ocr_needed_pages']} need OCR (scanned or broken text)"
+                  + (f" - missing: {', '.join(missing)}" if missing else " - OCR ran but did not fix them"))
         if q.get("ocr_done"):
             print("          OCR done on scanned pages")
         if q.get("rotated_pages"):
@@ -2195,7 +2399,8 @@ def main():
     print_final_metadata(json_dir)
 
     # 7. Create QA test-set template
-    write_qa_template(out_dir / "qa_test_set.csv")
+    qa_file = Path("qa_test_set.csv")
+    write_qa_template(qa_file)
 
     # 8. Print summary
     print(f"\nDone: {len(pdfs)} PDFs checked -> {out_dir}/")
@@ -2211,7 +2416,7 @@ def main():
     if ok:
         print(
             f"Next: check {out_dir}/markdown/, then write 30 questions "
-            f"in {out_dir}/qa_test_set.csv"
+            f"in {qa_file.resolve()}"
         )
 
 

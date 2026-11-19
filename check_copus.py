@@ -28,14 +28,14 @@ print(f"Database: {app.collection_name(strategy)}  ({total} chunks, {len(counts)
 kinds = Counter(m.get("doc_type", "?") for m in metas)
 print("By document type:")
 for kind, n in kinds.most_common():
-    print(f"{n:>7} {n * 100 / total:>5.1f}%  {kind}")
+    print(f"{n:>7} {n * 100 / total:>6.2f}%  {kind}")
 print()
 print(f"{'chunks':>7} {'share':>6}  file")
 for source, n in counts.most_common():
-    print(f"{n:>7} {n * 100 / total:>5.1f}%  {source}")
-    
+    print(f"{n:>7} {n * 100 / total:>6.2f}%  {source}")
+
 # Chunks with almost no real text (the heading line does not count)
-SHORT = 60
+SHORT = 100                                       # the reviewer measured < 100 characters
 real = [doc.split("\n", 1)[1] if "\n" in doc else doc for doc in data["documents"]]
 short = [(m.get("source", "?"), r) for m, r in zip(metas, real) if len(r.strip()) < SHORT]
 long_heads = [m.get("heading", "") for m in metas if len(m.get("heading", "")) > 150]
@@ -44,7 +44,6 @@ print(f"\nChunks with less than {SHORT} characters of real text: {len(short)} "
 for source, n in Counter(s for s, _ in short).most_common(5):
     print(f"{n:>7}  {source}")
 print(f"Heading paths longer than 150 characters: {len(long_heads)}")
-
 
 # Document titles (a title should never be a letterhead, stamp, date, number or "Annexure")
 try:

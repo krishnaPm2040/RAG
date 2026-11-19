@@ -1,3 +1,4 @@
+
 """pdf_to_clean_text.py
 ====================
 Day 1 of the RAG project: turn a folder of PDFs into a CLEAN text corpus.
@@ -67,7 +68,7 @@ Incremental runs
 Outputs, for every PDF:
   output/json/<doc_id>.json    structured sections (for chunking + metadata)
   output/markdown/<doc_id>.md  readable clean text (to check by eye)
-plus output/qa_test_set.csv, a template for your 30 hand-written Q&A pairs,
+plus qa_test_set.csv (in the project folder), a template for your 30 hand-written Q&A pairs,
 and  output/skipped_files.csv, every file that was skipped and why.
 
 Install:   pip install pymupdf pdfplumber
@@ -97,7 +98,7 @@ from pathlib import Path
 import pdfplumber  # good at finding tables
 import pymupdf     # PyMuPDF: text with font sizes/positions, links, images, bookmarks
 import hashlib
-
+import fitz
 # ===========================================================================
 # Settings you may want to tune for your documents
 # ===========================================================================
@@ -116,6 +117,7 @@ FOOTNOTE_SIZE_RATIO = 0.9    # footnotes use a smaller font than body text
 FOOTNOTE_ZONE = 0.6          # ...and sit in the bottom 40% of the page
 
 MIN_GUTTER_WIDTH = 8         # empty vertical strip (points) between columns
+BACKGROUND_IMAGE_SHARE = 0.5 # an image covering half the page or more = background, not a chart
 TEXTBOX_MIN_WORDS = 12       # a drawn box with this many words = text box,
                              # fewer = chart/diagram (its labels are dropped)
 TOC_MATCH_SHARE = 0.5        # use bookmarks only if >= 50% of them are found
@@ -123,25 +125,30 @@ TOC_MATCH_SHARE = 0.5        # use bookmarks only if >= 50% of them are found
 # Element 30: limits for corrupt / huge files
 MAX_SIZE_MB = 100            # bigger files are skipped
 MAX_PAGES = 800              # longer files are skipped
-PARSE_TIMEOUT_SEC = 1000      # a PDF that takes longer is stopped and skipped
+PARSE_TIMEOUT_SEC = 300      # a PDF that takes longer is stopped and skipped
 
 # Element 31: version metadata is read from the start of the document
 METADATA_HEAD_CHARS = 4000   # roughly the first page
 
 # Incremental runs: change this number whenever you change the CLEANING code.
 # Every PDF cleaned with an older number is cleaned again once.
-PIPELINE_VERSION = "1.8"   # 1.2 = page_end, 1.3 = cover IDs, doc types, safe dates, stale output, table symbols
+PIPELINE_VERSION = "2.3"   # 2.3 = annual report only by cover/title; FAQ by numbered questions
+                           # 1.2 = page_end, 1.3 = cover IDs, doc types, safe dates, stale output, table symbols
+                           # 1.4 = infographics: numbers are not headings, long "headings" are text
                            # 1.5 = page frames / prose boxes are not tables; safer cross-page merge
                            # 1.6 = good titles: no letterhead, stamp, watermark, date, number, "Annexure"
                            # 1.7 = doc types: annual reports detected; "business model Our" is not a manual
                            # 1.8 = supersedes = circular numbers / dated references only; FAQ doc type
-                           # 1.4 = infographics: numbers are not headings, long "headings" are text
+                           # 1.9 = fix: the title "Sub:" pattern no longer replaces the letter-block one
+                           # 2.0 = text printed on a background picture is kept (was dropped as chart labels)
+                           # 2.1 = annual reports also detected from the raw cover page (renamed files)
+                           # 2.2 = that check really runs now (raw pages 1-3 + PDF title)
 
 TOC_WORDS = re.compile(r"^\s*(table of contents|contents|index)\s*$", re.I)
 REFERENCE_WORDS = re.compile(r"^\s*(references|bibliography|works cited|sources)\s*$", re.I)
 TOC_LINE = re.compile(r"(\.{3,}|\s{3,}|…+)\s*\d{1,4}\s*$")       # "Intro ..... 12"
 
-BULLET_CHARS = "•●▪■◦○‣∙·–—-*"
+BULLET_CHARS = "•●▪■◦○‣∙·–—-*➢➤►▶✓✔❖"
 BULLET_LINE = re.compile(rf"^\s*[{re.escape(BULLET_CHARS)}]\s+")
 NUMBERED_LINE = re.compile(r"^\s*(\(?\d{1,3}[.)]|\(?[a-z][.)]|\(?[ivxlc]{1,5}[.)])\s+", re.I)
 LIST_ITEM_MD = re.compile(r"^\s*(- |\d{1,3}[.)] )")
@@ -655,7 +662,18 @@ def find_boxes(page, lines, table_boxes):
         w, h = b[2] - b[0], b[3] - b[1]
         return w > 50 and h > 20 and w * h < 0.8 * page_area
 
-    charts = [b for b in images if big_enough(b)]
+    def prose_inside(b):
+        inner = [ln for ln in lines if inside(ln["bbox"], b)]
+        words = sum(len(ln["text"].split()) for ln in inner)
+        avg_len = sum(len(ln["text"]) for ln in inner) / max(len(inner), 1)
+        return words >= TEXTBOX_MIN_WORDS and avg_len >= 20
+
+    # An image is a CHART only when the text on it is chart labels. A background picture
+    # (big, or with real sentences printed on top, e.g. the BEAWARE booklet pages) is not:
+    # its text is normal content and must be kept.
+    charts = [b for b in images if big_enough(b)
+              and (b[2] - b[0]) * (b[3] - b[1]) < BACKGROUND_IMAGE_SHARE * page_area
+              and not prose_inside(b)]
     textboxes = []
     for b in drawings:
         if not big_enough(b) or any(overlap_share(b, t) > 0.5 for t in table_boxes):
@@ -1507,8 +1525,40 @@ def find_circular_no(head: str):
     return None
 
 
+ANNUAL_COVER = re.compile(r"\b(?:integrated\s+)?annual\s+report\b", re.I)
+RESULTS_LETTER = re.compile(r"\b(?:audited|unaudited)\s+(?:standalone\s+|consolidated\s+)?financial\s+results\b"
+                            r"|\boutcome\s+of\s+(?:the\s+)?board\s+meeting\b", re.I)
+
+
+def is_annual_report_pdf(pdf_path) -> bool:
+    """A company's annual report or results? (2.3)
+    YES : "ANNUAL REPORT 2025-26" on the COVER (top of page 1) or in the PDF's own title,
+          or "audited financial results" in the first 3 pages (results sent to the stock exchange).
+    NO  : "ANNUAL REPORT 2024-25" only as a running page footer. That is a CHAPTER of RBI's own
+          Annual Report ("Regulation, Supervision and Financial Stability"): it is RBI content
+          and stays in the database (review: 'Annual report.pdf' was wrongly left out)."""
+    try:
+        with pymupdf.open(str(pdf_path)) as doc:
+            first = doc[0].get_text() if len(doc) else ""
+            raw = " ".join(doc[i].get_text() for i in range(min(3, len(doc))))
+            title = (doc.metadata or {}).get("title") or ""
+    except Exception:
+        return False
+    cover = first.strip()[:600]                    # the cover = the first lines of page 1
+    return bool(ANNUAL_COVER.search(cover) or ANNUAL_COVER.search(title) or RESULTS_LETTER.search(raw))
+
+
+NUMBERED_QUESTION = re.compile(
+    r"^\s*(?:Q\.?\s*)?\d{1,3}[.)]\s+(?:What|How|Can|Is|Are|Who|Whom|Where|When|Why|Will|Do|Does|"
+    r"Should|Which|Whether|Has|Have|May)\b[^\n]*", re.M | re.I)
+
+
 def detect_doc_type(head: str) -> str:
-    """Fix A2: first type in DOC_TYPES whose pattern is found on page 1."""
+    """Fix A2: first type in DOC_TYPES whose pattern is found on page 1.
+    2.3: a page of numbered questions ("1. What is Digital Rupee?") is an FAQ even when the
+    word "FAQ" is not printed (FAQ1, FAQ2, FAQ3 were typed as circulars)."""
+    if not RBI_REF_NO.search(head) and len(NUMBERED_QUESTION.findall(head)) >= 2:
+        return "faq"
     for doc_type, rule in DOC_TYPES.items():
         if doc_type == "faq" and RBI_REF_NO.search(head):
             continue                      # a circular that only MENTIONS FAQs stays a circular
@@ -1539,6 +1589,19 @@ def extract_manual_metadata(head: str) -> dict:
         "brand": brand.group(1).strip() if brand else None,
         "doc_version": version.group(1) if version else None,
     }
+
+
+def raw_cover_text(pdf_path, pages=3) -> str:
+    """Plain text of the first pages + PDF metadata title, before any cleaning."""
+    try:
+        doc = fitz.open(pdf_path)
+        try:
+            text = " ".join(doc[i].get_text() for i in range(min(pages, len(doc))))
+            return (doc.metadata or {}).get("title", "") + " " + text
+        finally:
+            doc.close()
+    except Exception:
+        return ""
 
 
 def extract_version_metadata(text: str) -> dict:
@@ -1820,6 +1883,7 @@ def prepare_pdf(pdf_path: Path, work_dir: Path):
             path, info["ocr_done"] = final, True
     return path, info
 
+
 def ocr_command():
     """'ocrmypdf' on PATH, or 'python -m ocrmypdf' when it is only pip-installed in the venv."""
     if shutil.which("ocrmypdf"):
@@ -1841,7 +1905,6 @@ def missing_ocr_tools():
     if not any(shutil.which(g) for g in ("gs", "gswin64c", "gswin32c")):
         missing.append("Ghostscript (see README: OCR setup)")
     return missing
-
 
 
 def inspect_pages(doc):
@@ -1996,7 +2059,8 @@ def fix_section_text(sections, watermarks):
 # Document title: never a letterhead, stamp, watermark, date, number or label
 # ---------------------------------------------------------------------------
 
-SUBJECT_LINE = re.compile(r"^\s*(?:sub(?:ject)?|re)\s*[:.\-–]\s*(.{8,200})$", re.I | re.M)
+SUBJECT_TITLE = re.compile(r"^\s*(?:sub(?:ject)?|re)\s*[:.\-–]\s*(.{8,200})$", re.I | re.M)
+                               # own name: SUBJECT_LINE (above) is used by remove_letter_blocks
 LETTERHEAD = re.compile(       # "Reserve Bank of India", "RBI - Central Office - Mumbai", "www.rbi.org.in"
     r"^\s*(?:reserve\s+bank\s+of\s+india|rbi|www\.rbi\.org\.in)\b"
     r"(?:[\s,\-–/]*(?:central\s+office|head\s+office|mumbai|new\s+delhi|india"
@@ -2045,7 +2109,7 @@ def title_from_file_name(path: Path) -> str:
 
 def choose_title(parsed, sections, pdf_path: Path, watermarks):
     """First GOOD candidate: subject line, title found by the parser, headings, file name."""
-    candidates = [m.group(1) for m in SUBJECT_LINE.finditer(parsed.get("original_head", ""))][:1]
+    candidates = [m.group(1) for m in SUBJECT_TITLE.finditer(parsed.get("original_head", ""))][:1]
     candidates.append(parsed.get("title", ""))
     candidates += [s["text"].lstrip("# ").strip() for s in sections if s["type"] == "heading"][:15]
     for c in candidates:
@@ -2278,6 +2342,14 @@ def main():
             cleaned_text = to_markdown(parsed)
             head = parsed.pop("original_head", "")      # first page before element 27
             parsed["metadata"] = extract_version_metadata(head + "\n" + cleaned_text)
+            # The cover page (often only "Annual Report 2025-26" in big letters) can be removed
+            # by the cleaning above, so also check the RAW first 3 pages and the PDF's own title.
+            if parsed["metadata"].get("doc_type") != "annual_report" and is_annual_report_pdf(pdf):
+                parsed["metadata"]["doc_type"] = "annual_report"
+                print("          type    : annual_report (found on the raw cover pages)")
+            elif parsed["metadata"].get("doc_type") == "annual_report" and not is_annual_report_pdf(pdf):
+                parsed["metadata"]["doc_type"] = "general"   # only a page footer said "Annual Report"
+                print("          type    : general (RBI Annual Report chapter, kept)")
             if parsed.get("stamp"):                      # Element 23: "SUPERSEDED" stamp
                 parsed["metadata"]["stamp"] = parsed["stamp"]
                 parsed["metadata"]["is_latest"] = False
@@ -2398,7 +2470,8 @@ def main():
     superseded_links = link_superseded(json_dir)
     print_final_metadata(json_dir)
 
-    # 7. Create QA test-set template
+    # 7. Create QA test-set template in the PROJECT folder (next to eval.py), not in output/:
+    #    output/ is not committed to git, and the reviewer needs this file in the repo
     qa_file = Path("qa_test_set.csv")
     write_qa_template(qa_file)
 

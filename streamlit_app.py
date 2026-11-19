@@ -26,7 +26,11 @@ with st.sidebar:
     st.header("Settings")
     strategy = st.selectbox("Chunking strategy", ["recursive", "fixed", "semantic"],
                             help="Each strategy has its own database. Build them with: python app.py")
-    use_hybrid = st.checkbox("Hybrid search (BM25 + vectors)", value=False)
+    scope_label = st.radio("Search in", ["All documents", "Circulars only", "Annual reports only"],
+                           help="Circulars only = annual reports are not searched.")
+    scope = {"All documents": "all", "Circulars only": "circulars",
+             "Annual reports only": "annual_reports"}[scope_label]
+    use_hybrid = st.checkbox("Hybrid search (BM25 + vectors)", value=True)
     use_rerank = st.checkbox("Re-ranker (keeps 5 sources)", value=False,
                              help="First use downloads a small model (~90 MB).")
     use_rewrite = st.checkbox("Query rewriting", value=False)
@@ -46,6 +50,12 @@ def load_db(strategy_name):
     return app.get_vector_db(strategy=strategy_name)
 
 
+@st.cache_resource(show_spinner="Loading the chat model (first time only)...")
+def warm_up_model():
+    app.warm_up()
+    return True
+
+
 @st.cache_resource(show_spinner=False)
 def load_reranker():
     return app.get_reranker()
@@ -62,6 +72,7 @@ if not app.is_built(strategy):                       # the UI never builds: app.
 try:
     with st.spinner(f"Opening the '{strategy}' vector database..."):
         vector_db = load_db(strategy)
+    warm_up_model()                       # loads qwen into memory once, before the first question
     if use_rerank:
         with st.spinner("Loading the re-ranker..."):
             load_reranker()
@@ -127,11 +138,14 @@ if question:
         st.markdown(safe(question))
 
     with st.chat_message("assistant"):
+        live = st.empty()                                  # the answer appears here word by word
         with st.spinner("Searching the documents..."):
             try:
                 reply = app.answer_question(vector_db, question, history,
                                             hybrid=use_hybrid, rerank_on=use_rerank,
-                                            rewrite=use_rewrite)
+                                            rewrite=use_rewrite,
+                                            scope=scope,
+                                            on_token=lambda text: live.markdown(safe(text) + " ▌"))
             except Exception as e:
                 reply = {"answer": f"Error: {e}", "results": [], "cited": set(),
                          "invalid_citations": [], "question_used": question}
@@ -147,7 +161,7 @@ if question:
                    if not reply["cited"] or i in reply["cited"]]   # only sources the answer used
         understood = reply["question_used"] if reply["question_used"] != question else ""
 
-        st.markdown(safe(reply["answer"]))
+        live.markdown(safe(reply["answer"]))
         if understood:
             st.caption(f"Understood as: {understood}")
         if reply["invalid_citations"]:

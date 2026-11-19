@@ -17,6 +17,11 @@ a header row. Columns (in this order when there is no header):
   add --k=5 to change the k used to score EVERY setup (default 5)
 
   python eval.py --report       -> eval_report.md: before/after table from eval_results.csv
+  python eval.py --all          -> recursive + fixed + semantic in one go (add --hybrid / --rerank)
+  python eval.py --all --setups -> each strategy x (baseline, +hybrid, +hybrid+rerank): 9 runs, slow
+                                   both write eval_details_all.csv: every question of every setup
+  python eval.py --ids          -> doc_id of every file (put it in source_doc_id: renaming
+                                   a PDF then no longer breaks the test set)
 
 Fair comparison: every setup is scored on the SAME k (Hit@1, Hit@3, Hit@k, MRR@k),
 even though the chatbot itself gives 3 sources (5 with the re-ranker) to the LLM.
@@ -114,8 +119,35 @@ def parse_pages(text):
     return {int(p) for p in re.findall(r"\d+", str(text or ""))}
 
 
+def check_not_damaged(path, raw):
+    """Excel 'Save as CSV' breaks this file: it puts each line in quotes and cuts it at every
+    comma. That cannot be repaired, so stop with a clear message. (A wrong encoding such as
+    'â‚¹' instead of the rupee sign IS repaired: see fix_encoding.)"""
+    lines = [l for l in raw.splitlines() if l.strip()]
+    wrapped = sum(1 for l in lines if l.startswith('"') and "\t" in l)
+    if lines and wrapped > len(lines) / 2:
+        sys.exit(f"{path} looks DAMAGED (saved by Excel: every line is in quotes and cut at commas).\n"
+                 f"Put the original qa_test_set.csv back. To look at it, use Notepad or VS Code.")
+
+
+def fix_encoding(raw):
+    """'â‚¹' / 'â€“' (UTF-8 read as Windows-1252) -> the real characters."""
+    if "â" not in raw and "Ã" not in raw:
+        return raw
+    try:
+        return raw.encode("cp1252").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return raw
+
+
 def read_csv_rows(path):
-    raw = path.read_text(encoding="utf-8-sig")
+    data = path.read_bytes()
+    try:
+        raw = data.decode("utf-8-sig")
+    except UnicodeDecodeError:                          # saved as ANSI by Notepad / Excel
+        raw = data.decode("cp1252", errors="replace")
+    raw = fix_encoding(raw)
+    check_not_damaged(path, raw)
     delimiter = "\t" if raw.count("\t") > raw.count(",") / 3 else ","
     rows = list(csv.reader(raw.splitlines(), delimiter=delimiter))
     rows = [r for r in rows if any(c.strip() for c in r)]
@@ -163,8 +195,24 @@ def load_cases():
 # ---------------------------------------------------------------------------
 
 def same_doc(doc, case):
+    """Right document? First by doc_id (PDF content fingerprint: survives renaming the
+    file), then by file name."""
+    doc_id = (doc.metadata.get("doc_id") or "").lower()
+    if doc_id and case["doc_id"].lower() == doc_id:
+        return True
     src = norm_name(doc.metadata.get("source"))
     return src in {norm_name(case["file"]), norm_name(case["doc_id"])} - {""}
+
+
+def print_doc_ids():
+    """python eval.py --ids : the doc_id of every file in the database (for new test questions)."""
+    data = get_vector_db().get(include=["metadatas"])
+    ids = {}
+    for m in data["metadatas"]:
+        ids[m.get("source", "?")] = m.get("doc_id", "") or "(rebuild: python app.py --rebuild)"
+    print(f"{'doc_id':<14} file")
+    for source, doc_id in sorted(ids.items()):
+        print(f"{doc_id:<14} {source}")
 
 
 def is_hit(doc, case):
@@ -199,8 +247,7 @@ def test_file():
 def run_settings(vector_db):
     """Day 4 #2: everything needed to tell runs apart later."""
     path = test_file()
-    chat_model = (getattr(app, "HF_MODEL", "") if getattr(app, "LLM_PROVIDER", "") == "huggingface"
-                  else getattr(app, "CHAT_MODEL", ""))
+    chat_model = getattr(app, "CHAT_MODEL", "")
     return {
         "strategy": CHUNK_STRATEGY,
         "hybrid": USE_HYBRID, "rerank": USE_RERANK, "rewrite": USE_REWRITE,
@@ -425,15 +472,18 @@ def write_report():
     print("\nSaved: eval_report.md")
 
 
-if __name__ == "__main__":
-    if "--report" in sys.argv:
-        write_report()
-        sys.exit()
-    cases = load_cases()
-    label = run_label()
-    print(f"Setup: {label}\n")
+def use_setup(strategy, hybrid, rerank, rewrite):
+    """Switch eval.py AND app.py to one setup (used by --all to run several in one go)."""
+    global CHUNK_STRATEGY, USE_HYBRID, USE_RERANK, USE_REWRITE
+    CHUNK_STRATEGY, USE_HYBRID, USE_RERANK, USE_REWRITE = strategy, hybrid, rerank, rewrite
+    app.CHUNK_STRATEGY, app.USE_HYBRID, app.USE_RERANK, app.USE_REWRITE = strategy, hybrid, rerank, rewrite
 
-    vector_db = get_vector_db()
+
+def run_one(cases):
+    """Run ONE setup: print the scores, save eval_results.csv + eval_details_<setup>.csv."""
+    label = run_label()
+    print(f"\nSetup: {label}\n")
+    vector_db = get_vector_db(strategy=CHUNK_STRATEGY)
     settings = run_settings(vector_db)
     details = run_questions(vector_db, cases)
     s = score(details)
@@ -448,7 +498,7 @@ if __name__ == "__main__":
     print(f"  Setup                  : {label}")
     print(f"  Scored at k            : {EVAL_K} for every setup (the chatbot answers from {answer_k()})")
     if "hit_rate" in s:
-        print(f"  Hit@1 / Hit@3 (page)   : {s['hit@1']:.3f} / {s['hit@3']:.3f}")
+        print(f"  Hit@1 / Hit@3 (page)   : {s['hit@1']:.3f} / {s['hit@3']:.3f}")   
         print(f"  Hit@{EVAL_K} (page)           : {s['hit_rate']:.3f}   ({s['answerable']} questions)")
         print(f"  MRR@{EVAL_K}                  : {s['mrr']:.3f}")
         print(f"  Right document @{EVAL_K}      : {s['doc_hit_rate']:.3f}")
@@ -469,3 +519,59 @@ if __name__ == "__main__":
     save_summary(label, s, settings, faithfulness, relevance)
     details_file = save_details(label, details, ragas_df)
     print(f"Saved: {RESULTS_FILE} (summary) and {details_file} (every question)")
+    return label, s, details_file
+
+
+ALL_FILE = Path("eval_details_all.csv")
+
+
+def run_all(cases):
+    """--all : recursive, fixed AND semantic (with the flags you gave, e.g. --hybrid).
+    --all --setups : each strategy x (baseline, +hybrid, +hybrid+rerank) = 9 runs (slow).
+    Every question of every run goes into ONE file: eval_details_all.csv."""
+    flags = [(USE_HYBRID, USE_RERANK, USE_REWRITE)]
+    if "--setups" in sys.argv:
+        flags = [(False, False, False), (True, False, False), (True, True, False)]
+    runs, rows, header = [], [], None
+    for strategy in ("recursive", "fixed", "semantic"):
+        if not app.is_built(strategy):
+            print(f"\n(skipped {strategy}: database not built. Run: python app.py --strategy={strategy})")
+            continue
+        for hybrid, rerank, rewrite in flags:
+            use_setup(strategy, hybrid, rerank, rewrite)
+            label, s, details_file = run_one(cases)
+            runs.append((label, s))
+            with details_file.open(encoding="utf-8-sig") as f:
+                part = list(csv.reader(f))
+            header = ["setup"] + part[0]
+            rows += [[label] + r for r in part[1:]]
+    if not runs:
+        sys.exit("No database is built. Run: python app.py")
+
+    with ALL_FILE.open("w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        w.writerow(header)
+        w.writerows(rows)
+
+    print("\n" + "=" * 72)
+    print(f"  {'setup':<28}{'Hit@1':>8}{'Hit@3':>8}{f'Hit@{EVAL_K}':>8}{f'MRR@{EVAL_K}':>8}{'Doc@k':>8}")
+    for label, s in runs:
+        if "hit_rate" in s:
+            print(f"  {label:<28}{s['hit@1']:>8.3f}{s['hit@3']:>8.3f}{s['hit_rate']:>8.3f}"
+                  f"{s['mrr']:>8.3f}{s['doc_hit_rate']:>8.3f}")
+    print("=" * 72)
+    print(f"Saved: {ALL_FILE} ({len(rows)} rows: every question of every setup, column 'setup')")
+
+
+if __name__ == "__main__":
+    if "--report" in sys.argv:
+        write_report()
+        sys.exit()
+    if "--ids" in sys.argv:
+        print_doc_ids()
+        sys.exit()
+    cases = load_cases()
+    if "--all" in sys.argv:
+        run_all(cases)
+    else:
+        run_one(cases)

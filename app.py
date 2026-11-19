@@ -46,22 +46,23 @@ DOMAIN = "RBI circulars"                        # used in all prompts: change it
 CHUNK_SIZE = 1000                               # characters (about 200 words)
 CHUNK_OVERLAP = 150
 SEMANTIC_MAX_CHARS = 2000                       # semantic chunks bigger than this are split again
-ANNUAL_REPORT = re.compile(r"an(?:nu|v)al[\s_-]*report|financial[\s_-]*results", re.I)
-                                                # annual reports + results ("anval" = typo in a file name)
 MIN_SECTION_CHARS = 60                          # smaller sections (text boxes, "38%") join a neighbour
 MAX_HEADING_PATH = 150                          # a heading path never becomes a whole paragraph
 SMALL_SECTION_CHARS = 300                       # sibling sections smaller than this are merged (Day 2 #2)
 MIN_CHUNK_CHARS = 100                           # a chunk with less real text joins its neighbour
 INCLUDE_ANNUAL_REPORTS = False                  # False = annual reports are NOT put in the database
 ANNUAL_CHUNK_SIZE = 2500                        # annual reports: bigger chunks -> far fewer chunks
-MAX_PER_SOURCE = 2                              # at most 2 chunks from one file in an answer
+DOC_FOCUS = True                                # also search INSIDE the best document (fixes "DOC ONLY")
+DOC_FOCUS_K = 3                                 # best chunks of that document to merge in
+MAX_PER_SOURCE = 3                              # at most 3 chunks from one file (0 = no limit). Was 2: that hid
+                                                # FAQ answers when one FAQ file holds many answers
 SEMANTIC_PERCENTILE = 95                        # cut where the topic change is in the top 5% of a section
 SEMANTIC_OUTLIER = 1.5                          # ...AND an outlier among ALL gaps: > Q3 + 1.5 x IQR (Day 2 #1)
 SEMANTIC_MIN_GAP = 0.0                          # optional fixed floor for the gap (cosine distance)
 DB_VERSION = "v4"                               # raise (v2, v3...) when you change the chunking CODE
 
 EMBED_MODEL = "nomic-embed-text"                # local; first run: ollama pull nomic-embed-text
-CHAT_MODEL = "qwen2.5:7b"                       # local chat model: ollama pull qwen2.5:7b
+CHAT_MODEL = "qwen3:8b"                       # local chat model: ollama pull qwen3:8b
 BATCH_SIZE = 50                                 # chunks embedded at a time
 
 FETCH_K = 20                                    # candidates fetched before merge / re-rank
@@ -88,7 +89,15 @@ RULES
    If a passage is from an older or superseded circular, say that it is old.
 7. Keep answers short and clear: first the direct answer in one or two sentences,
    then any conditions or exceptions as short bullet points.
-8. Answer in the same language as the question."""
+8. Answer in the same language as the question.
+9. Some rules apply only to a SPECIAL CASE: one kind of entity (for example "a WOS of a foreign
+   bank", "Payments Banks", "NRIs"), one period (for example "for the first three years") or one
+   product. Never present a special-case rule as the general rule. If the context has a general
+   rule AND a special case, give the general rule first, then the special case as an exception,
+   saying who it applies to. Do not widen it ("a commercial bank, including a WOS..." is wrong
+   when the passage is only about a WOS).
+10. Read ALL passages before answering: the general rule may be in a different passage than the
+   one that looks closest to the question."""
 
 HISTORY_TURNS = 3                               # earlier Q&A used to understand follow-ups
 
@@ -104,11 +113,12 @@ for arg in sys.argv:
 USE_HYBRID = "--hybrid" in sys.argv
 USE_RERANK = "--rerank" in sys.argv
 USE_REWRITE = "--rewrite" in sys.argv
-TOP_K = 5 if USE_RERANK else 3                  # chunks given to the LLM
+TOP_K = 5                                       # chunks given to the LLM (was 3: in a 412-page
+                                                # direction the passage with the rule was often 4th)
 
 
 def top_k_for(rerank):
-    return 5 if rerank else 3
+    return 5
 
 
 # ---------------------------------------------------------------------------
@@ -196,8 +206,9 @@ def load_documents():
     for json_file in files:
         data = json.loads(json_file.read_text(encoding="utf-8"))
         meta = data.get("metadata", {})
-        is_annual = (meta.get("doc_type") == "annual_report"            # found by clean_pdfs.py
-                     or bool(ANNUAL_REPORT.search(data["file_name"] + " " + (data.get("title") or ""))))
+        # Review fix: decided by doc_type ONLY (clean_pdfs.py reads the cover), never by the FILE
+        # NAME. "Annual report.pdf" is a chapter of RBI's own Annual Report: RBI content, kept.
+        is_annual = meta.get("doc_type") == "annual_report"
         if is_annual and not INCLUDE_ANNUAL_REPORTS:
             print(f"  skipped (annual report): {data['file_name']}")
             continue
@@ -220,6 +231,9 @@ def load_documents():
                 page_content=body,                           # heading is added to EVERY chunk later
                 metadata={                                   # no None values for Chroma
                     "source": data["file_name"],
+                    # The PDF's content fingerprint: it does NOT change when the file is renamed,
+                    # so the test set can point to a document by doc_id (eval.py) and never breaks.
+                    "doc_id": (data.get("file_hash") or "")[:12],
                     "title": data.get("title", "") or "",
                     "page": section["page"],
                     "page_end": section.get("page_end") or section["page"],
@@ -454,7 +468,7 @@ def data_fingerprint(strategy=None):
     h = hashlib.sha256()
     settings = [strategy or CHUNK_STRATEGY, CHUNK_SIZE, CHUNK_OVERLAP,
                 SEMANTIC_MAX_CHARS, DB_VERSION, EMBED_MODEL, ANNUAL_CHUNK_SIZE,
-                ANNUAL_REPORT.pattern, INCLUDE_ANNUAL_REPORTS,
+                INCLUDE_ANNUAL_REPORTS,
                 MIN_SECTION_CHARS, MAX_HEADING_PATH, SMALL_SECTION_CHARS, MIN_CHUNK_CHARS,
                 SEMANTIC_PERCENTILE, SEMANTIC_OUTLIER, SEMANTIC_MIN_GAP]
     h.update(json.dumps(settings).encode())
@@ -586,6 +600,8 @@ def in_scope(meta, scope):
 
 def limit_per_source(docs, limit=MAX_PER_SOURCE):
     """Keep at most `limit` chunks per file, so one big report cannot fill every slot."""
+    if not limit:
+        return list(docs)
     seen, kept = {}, []
     for d in docs:
         src = d.metadata.get("source")
@@ -596,21 +612,38 @@ def limit_per_source(docs, limit=MAX_PER_SOURCE):
 
 
 # 4b. Follow-up questions -> one standalone question
-FOLLOW_UP = re.compile(
-    r"^\s*(?:and|or|but|also|so|then|what about|how about|same|why|why not|is that|are they|does it|"
-    r"can it|what if|in that case)\b"
-    r"|\b(?:it|its|it's|they|them|their|this|that|these|those|the same|above|such|there|he|she|"
-    r"former|latter|mentioned)\b", re.I)
+# Review fix: the gate was too broad. "that", "this", "there", "such" and "mentioned" are in
+# many COMPLETE questions ("Is there a fee...?", "the limit that applies...", "documents
+# mentioned in the KYC direction"), so they no longer count on their own.
+FOLLOW_UP_START = re.compile(
+    r"^\s*(?:and|or|but|also|so|then|what about|how about|same for|why not|what if|in that case|"
+    r"is that|are they|does it|can it|what else)\b", re.I)
+POINTS_BACK = re.compile(r"\b(?:it|its|it's|they|them|their|these|those|the same|"
+                         r"above|former|latter|he|she|his|her)\b", re.I)
+STOP_WORDS = {"what", "which", "when", "where", "does", "have", "with", "from", "about", "under",
+              "there", "that", "this", "into", "will", "would", "should", "could", "shall", "much",
+              "many", "your", "been", "were", "also", "than", "then", "they", "them", "their", "these",
+              "those", "same", "above", "apply", "applies", "mean", "means", "tell", "more"}
 TOPIC_WORD = re.compile(r"\b[A-Za-z]{4,}\b")
 
 
+def topic_words(question):
+    return [w for w in TOPIC_WORD.findall(question.lower()) if w not in STOP_WORDS]
+
+
 def looks_like_follow_up(question):
-    """Day 3 #4: only rewrite questions that need the conversation:
-    'and for rural accounts?', 'what is its limit?', 'why?' -> yes
-    'What is the KYC limit for small accounts?'               -> no (complete on its own)"""
-    if FOLLOW_UP.search(question):
+    """Day 3 #4 (narrowed): rewrite ONLY questions that need the conversation.
+    'and for rural accounts?'  'what is its limit?'  'Does it apply to NRIs?'  'why?'  -> yes
+    'Is there a fee for exchanging Rs 2000 notes?'                                   -> no
+    'What is the limit that applies to small accounts?'                              -> no
+    'What are the documents mentioned in the KYC direction?'                         -> no
+    A word like "it" counts only in a SHORT question: a long one names its own topic."""
+    if FOLLOW_UP_START.search(question):
         return True
-    return len(TOPIC_WORD.findall(question)) <= 1           # "limit?", "and rural?"
+    words = topic_words(question)
+    if POINTS_BACK.search(question) and len(words) <= 3:
+        return True
+    return len(words) <= 1                                   # "limit?", "penalty?"
 
 
 def make_standalone(question, history):
@@ -645,12 +678,60 @@ def rewrite_query(question):
 REF_TOKEN = re.compile(r"\b[A-Za-z]{2,10}(?:[./][A-Za-z0-9\-]+)*?[./]\d[\w.\-]*(?:/[\w.\-]+)+")
 
 
+def stem(word):
+    """Very small English stemmer, so a question and a document match on the same word in
+    another form: categories = category, ticked = tick, charges = charge, banks = bank.
+    (The complaint-form question missed because the form says "Category" and "tick mark".)"""
+    w = word
+    if len(w) <= 3 or not w.isalpha():
+        return w
+    if w.endswith(("ies", "ied")) and len(w) > 4:
+        w = w[:-3] + "y"
+    elif w.endswith("ing") and len(w) > 5:
+        w = w[:-3]
+    elif w.endswith("ed") and len(w) > 4:
+        w = w[:-2]
+    elif w.endswith(("sses", "xes", "zes", "ches", "shes")):
+        w = w[:-2]
+    elif w.endswith("s") and not w.endswith(("ss", "us", "is")):
+        w = w[:-1]
+    if w.endswith("e") and len(w) > 4:                      # issue / issued -> issu
+        w = w[:-1]
+    if len(w) > 4 and w[-1] == w[-2] and w[-1] not in "slz":  # "transferred" -> transfer
+        w = w[:-1]
+    return w
+
+
 def tokenize(text):
-    """Words, plus every circular number as ONE token (Day 3 #6):
+    """Words (stemmed), plus every circular number as ONE token (Day 3 #6):
     'RBI/2024-25/12' -> rbi, 2024, 25, 12  AND  rbi/2024-25/12"""
-    words = re.findall(r"\w+", text.lower())                # "Passport?" == "passport"
+    words = [stem(w) for w in re.findall(r"\w+", text.lower())]   # "Passports?" == "passport"
     refs = [r.lower().rstrip(".-") for r in REF_TOKEN.findall(text)]
     return words + refs
+
+
+# Users and RBI documents often use different words for the same thing. The QUESTION
+# gets the document's words too, so BM25 can match ("penalty" -> "fine", "punishable").
+QUERY_SYNONYMS = {
+    "penalty": ["fine", "punishable", "penal"], "penalties": ["fine", "punishable", "penal"],
+    "punishment": ["punishable", "fine"], "fine": ["penalty", "punishable"],
+    "fee": ["charge", "charges", "free"], "fees": ["charge", "charges"], "charge": ["fee"],
+    "old": ["specified", "sbns"], "demonetised": ["specified", "sbns", "withdrawal"],
+    "limit": ["maximum", "exceeding", "upto"], "maximum": ["limit", "exceeding", "upto"],
+    "deadline": ["due", "date", "last"], "complaint": ["grievance", "complainant"],
+    "nri": ["non-resident", "nris"], "nris": ["non-resident", "nri"],
+}
+
+
+_SYNONYMS = {}                                               # same table, in stemmed form
+for _k, _vs in QUERY_SYNONYMS.items():
+    _SYNONYMS.setdefault(stem(_k), [])
+    _SYNONYMS[stem(_k)] += [stem(v) for v in _vs if stem(v) not in _SYNONYMS[stem(_k)]]
+
+
+def expand_query(tokens):
+    extra = [s for t in tokens for s in _SYNONYMS.get(t, [])]
+    return tokens + [e for e in extra if e not in tokens]
 
 
 class KeywordIndex:
@@ -659,13 +740,15 @@ class KeywordIndex:
         self.docs = docs
         self.bm25 = BM25Okapi([tokenize(d.page_content) for d in docs])
 
-    def search(self, query, k, only_latest=True, scope="all"):
-        scores = self.bm25.get_scores(tokenize(query))
+    def search(self, query, k, only_latest=True, scope="all", source=None):
+        scores = self.bm25.get_scores(expand_query(tokenize(query)))
         order = sorted(range(len(scores)), key=scores.__getitem__, reverse=True)
         hits = []
         for i in order:
             if scores[i] <= 0 or len(hits) >= k:
                 break
+            if source and self.docs[i].metadata.get("source") != source:
+                continue                                    # DOC_FOCUS: only this document
             if only_latest and not self.docs[i].metadata.get("is_latest", True):
                 continue
             if not in_scope(self.docs[i].metadata, scope):
@@ -746,10 +829,18 @@ def retrieve(vector_db, question, hybrid=None, rerank_on=None, rewrite=None, sco
     else:
         results = vector_db.similarity_search(query, k=k, filter=where)
 
+    only_latest = not OLD_VERSION_HINT.search(question)
     if hybrid:
-        keyword = get_keyword_index(vector_db).search(query, FETCH_K, scope=scope,
-                                                      only_latest=not OLD_VERSION_HINT.search(question))
+        keyword = get_keyword_index(vector_db).search(query, FETCH_K, scope=scope, only_latest=only_latest)
         results = rrf_merge([results, keyword])[:FETCH_K]
+    if DOC_FOCUS and results:
+        # "DOC ONLY" fix: the right DOCUMENT is usually found, but many of its chunks look alike
+        # (same title on every chunk). Search INSIDE the top document by exact words and merge
+        # its best chunks in, so the chunk that really holds the answer moves up.
+        top_source = results[0].metadata.get("source")
+        inside = get_keyword_index(vector_db).search(query, DOC_FOCUS_K, scope=scope,
+                                                     only_latest=only_latest, source=top_source)
+        results = rrf_merge([results, inside])[:FETCH_K]
     if rerank_on and results:
         results = rerank(query, results)
     return limit_per_source(results)[:top_k]

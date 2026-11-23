@@ -4,11 +4,13 @@ The chat is the web UI:  streamlit run streamlit_app.py
 
   1. python clean_pdfs.py            -> output/json/*.json
   2. ollama pull nomic-embed-text    -> embedding model
-     ollama pull qwen2.5:7b          -> chat model (runs on your PC)
+     ollama pull qwen3:8b            -> chat model (runs on your PC)
   3. python app.py                   -> builds / checks ALL 3 databases (recursive, fixed, semantic)
      python app.py --strategy=fixed  -> only one strategy
      python app.py --rebuild         -> force a rebuild
   4. streamlit run streamlit_app.py  -> the chat in your browser
+
+Everything runs on your PC with Ollama (no API key, no internet needed for answers).
 
 A database is rebuilt AUTOMATICALLY when the JSON files or the chunk settings
 change, or when the last build did not finish.
@@ -24,12 +26,13 @@ import math
 import re
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter, CharacterTextSplitter
-from langchain_ollama import OllamaEmbeddings, ChatOllama
 from langchain_chroma import Chroma
+from langchain_ollama import OllamaEmbeddings, ChatOllama
 
 
 
@@ -52,6 +55,15 @@ SMALL_SECTION_CHARS = 300                       # sibling sections smaller than 
 MIN_CHUNK_CHARS = 100                           # a chunk with less real text joins its neighbour
 INCLUDE_ANNUAL_REPORTS = False                  # False = annual reports are NOT put in the database
 ANNUAL_CHUNK_SIZE = 2500                        # annual reports: bigger chunks -> far fewer chunks
+# Extras added while fixing misses on the test set (review H1 / M5). Each can be switched off,
+# so eval.py can show what each one really adds (--synonyms / --no-stemming / --no-docfocus),
+# and they are judged on the held-out set (qa_heldout.csv), not on the questions they came from.
+# Keyword-only ablation (tests/ + eval.py): synonyms won ONLY q012, the question they were
+# written for, and nothing on the held-out set -> OFF. Stemming won q015 and also raised Hit@1 on
+# the held-out set (0.750 -> 0.812) -> ON. DOC_FOCUS changed nothing on keyword search; it was
+# added for VECTOR "DOC ONLY" misses, so `eval.py --all --setups` (with vectors) decides it.
+USE_SYNONYMS = False                            # QUERY_SYNONYMS: "penalty" also finds "fine"
+USE_STEMMING = True                             # "categories" = "category" in BM25
 DOC_FOCUS = True                                # also search INSIDE the best document (fixes "DOC ONLY")
 DOC_FOCUS_K = 3                                 # best chunks of that document to merge in
 MAX_PER_SOURCE = 3                              # at most 3 chunks from one file (0 = no limit). Was 2: that hid
@@ -59,10 +71,11 @@ MAX_PER_SOURCE = 3                              # at most 3 chunks from one file
 SEMANTIC_PERCENTILE = 95                        # cut where the topic change is in the top 5% of a section
 SEMANTIC_OUTLIER = 1.5                          # ...AND an outlier among ALL gaps: > Q3 + 1.5 x IQR (Day 2 #1)
 SEMANTIC_MIN_GAP = 0.0                          # optional fixed floor for the gap (cosine distance)
-DB_VERSION = "v4"                               # raise (v2, v3...) when you change the chunking CODE
+DB_VERSION = "v5"                               # raise (v2, v3...) when you change the chunking CODE
+                                                # v5: content-based chunk IDs, updated_on
 
-EMBED_MODEL = "nomic-embed-text"                # local; first run: ollama pull nomic-embed-text
-CHAT_MODEL = "qwen3:8b"                       # local chat model: ollama pull qwen3:8b
+EMBED_MODEL = "nomic-embed-text"                # first run: ollama pull nomic-embed-text
+CHAT_MODEL = "qwen3:8b"                         # first run: ollama pull qwen3:8b
 BATCH_SIZE = 50                                 # chunks embedded at a time
 
 FETCH_K = 20                                    # candidates fetched before merge / re-rank
@@ -83,42 +96,52 @@ RULES
    If a sentence uses two passages, cite both: [1][3].
 5. Quote amounts, limits, dates, time periods and circular numbers exactly as written
    in the context (for example "Rs 20,000", "90 days", "RBI/2024-25/12").
-6. Each passage header shows its circular number, issue date, and "OLD VERSION" if it was
-   withdrawn or superseded. If passages disagree, say so, and prefer the newest circular
-   (the latest issue date).
+6. Each passage header shows its circular number, issue date, the date of its latest update
+   ("updated ...") and "OLD VERSION" if it was withdrawn or superseded. If passages disagree,
+   say so, and prefer the most recent one: the later of its issue date and updated date.
    If a passage is from an older or superseded circular, say that it is old.
 7. Keep answers short and clear: first the direct answer in one or two sentences,
    then any conditions or exceptions as short bullet points.
 8. Answer in the same language as the question.
-9. Some rules apply only to a SPECIAL CASE: one kind of entity (for example "a WOS of a foreign
-   bank", "Payments Banks", "NRIs"), one period (for example "for the first three years") or one
-   product. Never present a special-case rule as the general rule. If the context has a general
-   rule AND a special case, give the general rule first, then the special case as an exception,
-   saying who it applies to. Do not widen it ("a commercial bank, including a WOS..." is wrong
-   when the passage is only about a WOS).
+9. Some rules apply only to a SPECIAL CASE: one kind of entity, one period of time or one product.
+   Never present a special-case rule as the general rule. If the context has a general rule AND
+   a special case, give the general rule first, then the special case as an exception, saying
+   who or what it applies to.
 10. Read ALL passages before answering: the general rule may be in a different passage than the
    one that looks closest to the question."""
 
 HISTORY_TURNS = 3                               # earlier Q&A used to understand follow-ups
 
-# Defaults from the command line (Streamlit / eval can pass their own per call)
+# Defaults. Streamlit / eval pass their own settings per call; the command line is read only
+# by apply_cli() (app.py's own __main__ and eval.py), never at import (review L5).
 CHUNK_STRATEGY = "recursive"
-for arg in sys.argv:
-    if arg.startswith("--strategy="):
-        CHUNK_STRATEGY = arg.split("=", 1)[1]
-SEARCH_SCOPE = "all"                            # eval.py: --scope=circulars / annual_reports
-for arg in sys.argv:
-    if arg.startswith("--scope="):
-        SEARCH_SCOPE = arg.split("=", 1)[1]
-USE_HYBRID = "--hybrid" in sys.argv
-USE_RERANK = "--rerank" in sys.argv
-USE_REWRITE = "--rewrite" in sys.argv
-TOP_K = 5                                       # chunks given to the LLM (was 3: in a 412-page
-                                                # direction the passage with the rule was often 4th)
+SEARCH_SCOPE = "all"
+USE_HYBRID = False
+USE_RERANK = False
+USE_REWRITE = False
+TOP_K = 5                                       # chunks given to the LLM
+
+
+def apply_cli(argv):
+    """--strategy=, --scope=, --hybrid, --rerank, --rewrite, --synonyms, --no-stemming,
+    --no-docfocus  ->  the module settings above."""
+    global CHUNK_STRATEGY, SEARCH_SCOPE, USE_HYBRID, USE_RERANK, USE_REWRITE
+    global USE_SYNONYMS, USE_STEMMING, DOC_FOCUS
+    for arg in argv:
+        if arg.startswith("--strategy="):
+            CHUNK_STRATEGY = arg.split("=", 1)[1]
+        elif arg.startswith("--scope="):
+            SEARCH_SCOPE = arg.split("=", 1)[1]
+    USE_HYBRID = "--hybrid" in argv
+    USE_RERANK = "--rerank" in argv
+    USE_REWRITE = "--rewrite" in argv
+    USE_SYNONYMS = "--synonyms" in argv
+    USE_STEMMING = "--no-stemming" not in argv
+    DOC_FOCUS = "--no-docfocus" not in argv
 
 
 def top_k_for(rerank):
-    return 5
+    return TOP_K
 
 
 # ---------------------------------------------------------------------------
@@ -134,13 +157,13 @@ class NomicEmbeddings(OllamaEmbeddings):
         return super().embed_query("search_query: " + text)
 
 
-embeddings = NomicEmbeddings(model=EMBED_MODEL)            # local Ollama (localhost:11434)
-
+embeddings = NomicEmbeddings(model=EMBED_MODEL)  # local Ollama (localhost:11434)
 llm = ChatOllama(                                # local Ollama chat model (no key, no internet)
     model=CHAT_MODEL,
     base_url="http://localhost:11434",
     temperature=0,
-    keep_alive="60m",                           # keep the model in memory: no reload wait
+    keep_alive="60m",                            # keep the model in memory: no reload wait
+    reasoning=False,                             # review M2: qwen3 must not "think" first
 )
 
 THINK = re.compile(r"<think>.*?(</think>|$)", re.S)  # "thinking" text of reasoning models: never shown
@@ -247,6 +270,7 @@ def load_documents():
                     "brand": meta.get("brand") or "",
                     "circular_no": meta.get("circular_no") or "",
                     "issue_date": meta.get("issue_date") or "",
+                    "updated_on": meta.get("updated_on") or "",
                     "is_latest": meta.get("is_latest", True),
                     "superseded_by": meta.get("superseded_by") or "",
                 },
@@ -438,12 +462,18 @@ def create_chunks(documents, strategy=None):
         chunks += merge_tiny_chunks(split_group(merge_sections(annual, ANNUAL_CHUNK_SIZE), strategy,
                                                 ANNUAL_CHUNK_SIZE), ANNUAL_CHUNK_SIZE)
 
-    for i, c in enumerate(chunks):              # EVERY chunk says which section it is from
+    seen = Counter()
+    for c in chunks:                            # EVERY chunk says which section it is from
         c.metadata["heading"] = c.metadata["heading"][:MAX_HEADING_PATH]
         c.page_content = c.metadata["heading"] + "\n" + c.page_content
-        # Day 3 #1: a unique ID per chunk (hybrid search merges on it, Chroma stores it)
-        c.metadata["chunk_id"] = hashlib.sha1(
-            f"{c.metadata['source']}|{c.metadata['page']}|{i}|{c.page_content}".encode()).hexdigest()[:16]
+        # Day 3 #1 / review L6: a unique ID from the chunk's file + page + TEXT only (not its
+        # position), so one changed chunk does not change the IDs of all chunks after it.
+        # The same text twice on one page gets "#2", "#3".
+        key = f"{c.metadata['source']}|{c.metadata['page']}|{c.page_content}"
+        seen[key] += 1
+        if seen[key] > 1:
+            key += f"#{seen[key]}"
+        c.metadata["chunk_id"] = hashlib.sha1(key.encode()).hexdigest()[:16]
 
     print(f"Chunks created ({strategy}): {len(chunks)}")
     return chunks
@@ -533,7 +563,7 @@ def get_vector_db(rebuild=False, strategy=None):
 
     if not rebuild and count and info.get("chunks") == count and info.get("fingerprint") == fingerprint:
         print(f"Vector database loaded: {count} chunks ({strategy})")
-        _keyword_indexes.pop(collection_name(strategy), None)
+        _drop_keyword_index(collection_name(strategy))
         _open_dbs[collection_name(strategy)] = vector_db
         return vector_db
 
@@ -552,7 +582,7 @@ def get_vector_db(rebuild=False, strategy=None):
     if not documents:
         sys.exit(f"No data in {JSON_FOLDER}/. Run clean_pdfs.py first.")
     build_vector_db(vector_db, create_chunks(documents, strategy), strategy, fingerprint)
-    _keyword_indexes.pop(collection_name(strategy), None)    # old BM25 index is out of date
+    _drop_keyword_index(collection_name(strategy))    # old BM25 index is out of date
     _open_dbs[collection_name(strategy)] = vector_db
     return vector_db
 
@@ -571,12 +601,15 @@ OLD_VERSION_HINT = re.compile(
     r"|\b(?:circular|direction|notification|guidelines?|master\s+(?:circular|direction))\b[^.?]{0,40}"
     r"\b(?:19|20)\d{2}\b"
     r"|\b(?:19|20)\d{2}\b[^.?]{0,20}\b(?:circular|direction|notification|guidelines?)\b"
-    r"|\b(?:superseded|supersedes|withdrawn|repealed|rescinded|no\s+longer\s+in\s+force"
+    # review M4: a bare "withdrawn" is NOT enough ("Is the Rs 2000 note withdrawn?" is about
+    # banknotes). Only "withdrawn ... circular / direction(s) / notification / guidelines".
+    r"|\bwithdrawn\s+(?:[\w,()-]+\s+){0,5}?(?:circular|directions?|notification|guidelines?)\b"
+    r"|\b(?:superseded|supersedes|repealed|rescinded|no\s+longer\s+in\s+force"
     r"|old(?:er)?\s+(?:circular|direction|version|rule|instruction|guideline)s?"
     r"|(?:previous|earlier)\s+(?:circular|direction|version|master\s+direction)s?)\b", re.I)
 
 
-SCOPES = {"all": None,                                     # sidebar "Search in"
+SCOPES = {"all": None,                                     # eval.py --scope= (the UI always uses "all")
           "circulars": {"doc_type": {"$ne": "annual_report"}},
           "annual_reports": {"doc_type": "annual_report"}}
 
@@ -705,7 +738,9 @@ def stem(word):
 def tokenize(text):
     """Words (stemmed), plus every circular number as ONE token (Day 3 #6):
     'RBI/2024-25/12' -> rbi, 2024, 25, 12  AND  rbi/2024-25/12"""
-    words = [stem(w) for w in re.findall(r"\w+", text.lower())]   # "Passports?" == "passport"
+    words = re.findall(r"\w+", text.lower())                       # "Passports?" == "passports"
+    if USE_STEMMING:
+        words = [stem(w) for w in words]                              # ... == "passport"
     refs = [r.lower().rstrip(".-") for r in REF_TOKEN.findall(text)]
     return words + refs
 
@@ -730,6 +765,8 @@ for _k, _vs in QUERY_SYNONYMS.items():
 
 
 def expand_query(tokens):
+    if not USE_SYNONYMS:
+        return list(tokens)
     extra = [s for t in tokens for s in _SYNONYMS.get(t, [])]
     return tokens + [e for e in extra if e not in tokens]
 
@@ -757,11 +794,16 @@ class KeywordIndex:
         return hits
 
 
-_keyword_indexes = {}                                       # one per collection
+_keyword_indexes = {}                                       # one per collection (and stemming)
+
+
+def _drop_keyword_index(name):
+    for key in [k for k in _keyword_indexes if k[0] == name]:
+        _keyword_indexes.pop(key)
 
 
 def get_keyword_index(vector_db):
-    name = vector_db._collection.name
+    name = (vector_db._collection.name, USE_STEMMING)     # stemming changes the index itself
     if name not in _keyword_indexes:
         data = vector_db.get(include=["documents", "metadatas"])
         docs = [Document(page_content=t, metadata=m)
@@ -820,8 +862,10 @@ def retrieve(vector_db, question, hybrid=None, rerank_on=None, rewrite=None, sco
         print(f"  (searching for: {query})")
 
     where = search_filter(question, scope)
-    k = FETCH_K                                            # fetch more, then keep max 2 per file
-    if MIN_RELEVANCE:                                      # cut-off on: keep only close matches
+    k = FETCH_K                                            # fetch more, then keep max 3 per file
+    # Cut-off (review M6): it uses the vector score, so it is NOT applied when the question
+    # names a circular number: an exact number is found by BM25 even when the vector score is low.
+    if MIN_RELEVANCE and not REF_TOKEN.search(question):   # cut-off on: keep only close matches
         scored = vector_db.similarity_search_with_relevance_scores(query, k=k, filter=where)
         if not scored or scored[0][1] < MIN_RELEVANCE:
             return []                                      # nothing close enough: "not found"
@@ -867,19 +911,25 @@ def passage_header(i, doc):
         parts.append(m["circular_no"])
     if m.get("issue_date"):
         parts.append(f"issued {m['issue_date']}")
+    if m.get("updated_on"):
+        parts.append(f"updated {m['updated_on']}")
     if m.get("is_latest") is False:
         parts.append("OLD VERSION (withdrawn or superseded"
                      + (f", replaced by {m['superseded_by']})" if m.get("superseded_by") else ")"))
     return f"[{i}] (" + " | ".join(parts) + ")"
 
 
-def generate_answer(question, results, on_token=None):
+def answer_messages(question, results):
     context = "\n\n".join(f"{passage_header(i, doc)}\n{doc.page_content}"
                             for i, doc in enumerate(results, start=1))
-    messages = [
+    return [
         ("system", SYSTEM_PROMPT),
         ("human", f"Context:\n{context}\n\nQuestion: {question}"),
     ]
+
+
+def generate_answer(question, results, on_token=None):
+    messages = answer_messages(question, results)
     if on_token is None:
         return ask(messages)
     answer = ""
@@ -910,6 +960,18 @@ def check_citations(answer, n_sources):
     return valid, sorted(used - valid)
 
 
+REFUSAL = re.compile(r"could not find this in the documents", re.I)
+
+
+def sources_to_show(answer, results):
+    """[(number, doc)] to show under an answer (review L2):
+    a refusal -> none; otherwise the cited sources, or all of them if the answer cites none."""
+    if REFUSAL.search(answer or "") and len(answer or "") < 120:
+        return []
+    cited, _ = check_citations(answer or "", len(results))
+    return [(i, d) for i, d in enumerate(results, start=1) if not cited or i in cited]
+
+
 GREETING = re.compile(r"\s*(hi|hello|hey|hai|good (morning|afternoon|evening)|thanks?|thank you)[\s!.]*",
                       re.I)
 
@@ -937,6 +999,7 @@ def answer_question(vector_db, question, history=None, hybrid=None, rerank_on=No
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    apply_cli(sys.argv)
     chosen = [a.split("=", 1)[1] for a in sys.argv if a.startswith("--strategy=")]
     strategies = chosen or ["recursive", "fixed", "semantic"]
     for name in strategies:

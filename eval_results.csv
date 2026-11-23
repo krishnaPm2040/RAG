@@ -1,2 +1,8 @@
-﻿time,setup,questions,hit_rate,mrr,doc_hit_rate,no_answer_acc,faithfulness,answer_relevance
-2026-11-13 13:18,recursive,30,1.000,0.910,1.000,1.000,,
+﻿time,setup,questions,hit@1,hit@3,hit@k,mrr@k,doc_hit@k,answer_correct,no_answer_acc,sec_per_q,faithfulness,answer_relevance,ragas_judge,strategy,hybrid,rerank,rewrite,synonyms,stemming,doc_focus,scope,eval_k,answer_k,retrieval_only,chunk_size,chunk_overlap,db_version,chunks_in_db,embed_model,chat_model,min_relevance,include_annual_reports,test_file,test_file_md5
+2026-11-23 22:40,bm25-pages,50,0.575,0.775,0.800,0.676,0.900,,,0.0,,,,pages,False,False,False,False,False,False,all,5,5,True,1000,150,v5,999,nomic-embed-text,ollama:qwen3:8b,0.0,False,qa_test_set.csv,f80e5628
+2026-11-23 22:46,bm25-pages,20,0.438,0.688,0.750,0.568,0.875,,,0.0,,,,pages,False,False,False,False,False,False,all,5,5,True,1000,150,v5,999,nomic-embed-text,ollama:qwen3:8b,0.0,False,qa_heldout.csv,7ebc3535
+2026-11-23 23:17,recursive,50,0.725,0.850,0.875,0.784,0.925,0.685,0.900,36.9,,,,recursive,False,False,False,False,True,True,all,5,5,False,1000,150,v5,2617,nomic-embed-text,ollama:qwen3:8b,0.0,False,qa_test_set.csv,f80e5628
+2026-11-23 23:48,recursive+hybrid,50,0.750,0.875,0.900,0.810,0.925,0.749,1.000,36.4,,,,recursive,True,False,False,False,True,True,all,5,5,False,1000,150,v5,2617,nomic-embed-text,ollama:qwen3:8b,0.0,False,qa_test_set.csv,f80e5628
+2026-11-23 23:50,recursive,20,0.562,0.812,0.812,0.677,0.875,,,0.3,,,,recursive,False,False,False,False,True,True,all,5,5,True,1000,150,v5,2617,nomic-embed-text,ollama:qwen3:8b,0.0,False,qa_heldout.csv,7ebc3535
+2026-11-23 23:50,recursive+hybrid,20,0.562,0.750,0.750,0.656,0.875,,,0.3,,,,recursive,True,False,False,False,True,True,all,5,5,True,1000,150,v5,2617,nomic-embed-text,ollama:qwen3:8b,0.0,False,qa_heldout.csv,7ebc3535
+2026-11-24 00:03,recursive+hybrid,20,0.562,0.750,0.750,0.656,0.875,0.762,1.000,35.1,,,,recursive,True,False,False,False,True,True,all,5,5,False,1000,150,v5,2617,nomic-embed-text,ollama:qwen3:8b,0.0,False,qa_heldout.csv,7ebc3535

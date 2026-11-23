@@ -1,34 +1,38 @@
 """
-eval.py - Task 3: test the RAG chatbot (Task 4: re-run after each improvement)
+eval.py - test the RAG chatbot (Day 4) and every improvement (Day 5) on the SAME questions.
 
-Reads your test questions from qa_test_set.csv (or test_set.csv / test_set.json).
-Works with your Excel file as it is: tab- or comma-separated, with or without
-a header row. Columns (in this order when there is no header):
+Test files (tab-separated, header row):
   id | question | expected_answer | source_doc_id | file_name | page | answer_type | notes
-  - page can be "2, 5" for an answer spread over two pages (hit if ANY page is found)
-  - answer_type "no_answer" = out-of-scope question: the bot must say it could not find it
+  - qa_test_set.csv : the main set (40 answerable + no_answer questions)
+  - qa_heldout.csv  : the HELD-OUT set. Never used to tune anything: judge the extras on it.
+  - page can be "2, 5" (hit if ANY of those pages is retrieved)
+  - answer_type "no_answer" = out of scope: the bot must say "I could not find this ..."
 
-  python eval.py --strategy=recursive                                  -> baseline
-  python eval.py --strategy=recursive --hybrid                         -> + BM25
-  python eval.py --strategy=recursive --hybrid --rerank                -> + re-ranker
-  python eval.py --strategy=recursive --hybrid --rerank --rewrite      -> + query rewriting
-  add --ragas to any line to also score faithfulness + answer relevance (slower)
-  add --test=myfile.csv to use another question file
-  add --k=5 to change the k used to score EVERY setup (default 5)
+One setup:
+  python eval.py --strategy=recursive                          baseline (vectors only)
+  python eval.py --strategy=recursive --hybrid                 + BM25
+  python eval.py --strategy=recursive --hybrid --rerank        + re-ranker
+  python eval.py --strategy=recursive --hybrid --rerank --rewrite
+  ablation (review H1 / M5):  add --synonyms (on)  --no-stemming  --no-docfocus
 
-  python eval.py --report       -> eval_report.md: before/after table from eval_results.csv
-  python eval.py --all          -> recursive + fixed + semantic in one go (add --hybrid / --rerank)
-  python eval.py --all --setups -> each strategy x (baseline, +hybrid, +hybrid+rerank): 9 runs, slow
-                                   both write eval_details_all.csv: every question of every setup
-  python eval.py --ids          -> doc_id of every file (put it in source_doc_id: renaming
-                                   a PDF then no longer breaks the test set)
+Everything (the evidence for the review):
+  python eval.py --bm25-pages             plain BM25 over whole pages: the floor to beat
+  python eval.py --all --setups           3 strategies x (base, +hybrid, +rerank, +rewrite)
+                                          + 3 ablation rows on recursive+hybrid: without
+                                          DOC_FOCUS, without stemming, with synonyms
+  python eval.py --report                 eval_report.md + the results table in README.md
 
-Fair comparison: every setup is scored on the SAME k (Hit@1, Hit@3, Hit@k, MRR@k),
-even though the chatbot itself gives 3 sources (5 with the re-ranker) to the LLM.
+Options for any line:
+  --test=qa_heldout.csv   another question file          --k=5   k used for EVERY setup
+  --retrieval-only        no answers: fast, scores only retrieval
+  --ragas                 also faithfulness + answer relevance (separate venv, see README)
+  --ids                   print the doc_id of every file in the database
 
-Every run:
-  - adds one row to eval_results.csv            (compare before / after)
-  - writes eval_details_<setup>.csv             (every question: hit, rank, answer)
+Fair comparison: every setup is scored at the SAME k (Hit@1, Hit@3, Hit@k, MRR@k). The
+chatbot itself answers from app.TOP_K = 5 passages.
+
+Every run adds one row to eval_results.csv (with all its settings) and writes
+eval_details_<test file>_<setup>.csv (every question: hit, rank, answer, key facts, seconds).
 """
 
 import csv
@@ -36,68 +40,22 @@ import hashlib
 import json
 import re
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
 import app
-from app import get_vector_db, llm, embeddings, CHUNK_STRATEGY
 
-EVAL_K = 5                                      # Day 4 #1: the SAME k for every setup
-for _arg in sys.argv:
-    if _arg.startswith("--k="):
-        EVAL_K = int(_arg.split("=", 1)[1])
+app.apply_cli(sys.argv)                          # review L5: app.py does not read sys.argv itself
 
-# Works with your app.py as it is: uses its functions when they exist,
-# otherwise does the same simple search + prompt itself.
-USE_HYBRID = getattr(app, "USE_HYBRID", False)
-USE_RERANK = getattr(app, "USE_RERANK", False)
-USE_REWRITE = getattr(app, "USE_REWRITE", False)
-MIN_RELEVANCE = getattr(app, "MIN_RELEVANCE", 0.0)
-
-
-def retrieve(vector_db, question, k=None):
-    if hasattr(app, "retrieve"):
-        try:
-            return app.retrieve(vector_db, question, top_k=k)
-        except TypeError:                           # older app.py without top_k
-            return app.retrieve(vector_db, question)
-    return vector_db.similarity_search(question, k=k or 3, filter={"is_latest": True})
-
-
-def answer_k():
-    """How many sources the CHATBOT gives the LLM (3, or 5 with the re-ranker)."""
-    return app.top_k_for(USE_RERANK) if hasattr(app, "top_k_for") else 3
-
-
-def generate_answer(question, results):
-    if hasattr(app, "generate_answer"):
-        return app.generate_answer(question, results)
-    context = "\n\n".join(
-        f"[{i}] ({d.metadata['source']}, page {d.metadata['page']})\n{d.page_content}"
-        for i, d in enumerate(results, start=1))
-    messages = [
-        ("system", f"You answer questions about {getattr(app, 'DOMAIN', 'RBI circulars')}. "
-                   "Use ONLY the context below. If the answer is not in the context, say "
-                   "'I could not find this in the documents.' Do not invent rules. "
-                   "When you use information from the context, cite it inline using the "
-                   "bracketed number, like [1] or [2], right after the relevant sentence."),
-        ("human", f"Context:\n{context}\n\nQuestion: {question}"),
-    ]
-    return llm.invoke(messages).content
-
-
-def top_relevance(vector_db, question):
-    if hasattr(app, "top_relevance"):
-        return app.top_relevance(vector_db, question)
-    return None                                     # only with the newer app.py
-
-TEST_FILES = [Path("qa_test_set.csv"), Path("output/qa_test_set.csv"),
-              Path("test_set.csv"), Path("test_set.json")]
-for arg in sys.argv:
-    if arg.startswith("--test="):
-        TEST_FILES = [Path(arg.split("=", 1)[1])]
-
+EVAL_K = next((int(a.split("=", 1)[1]) for a in sys.argv if a.startswith("--k=")), 5)
+TEST_FILE = Path(next((a.split("=", 1)[1] for a in sys.argv if a.startswith("--test=")),
+                      "qa_test_set.csv"))
+RETRIEVAL_ONLY = "--retrieval-only" in sys.argv
 RESULTS_FILE = Path("eval_results.csv")
+REPORT_FILE = Path("eval_report.md")
+README = Path("README.md")
+
 NOT_FOUND = re.compile(r"could not find|not (?:available|mentioned|found|present) in the (?:documents|context)"
                        r"|no information|does not (?:contain|mention)", re.I)
 COLUMNS = ["id", "question", "expected_answer", "source_doc_id", "file_name",
@@ -109,7 +67,7 @@ COLUMNS = ["id", "question", "expected_answer", "source_doc_id", "file_name",
 # ---------------------------------------------------------------------------
 
 def norm_name(text):
-    """'Governor’s Statement.pdf' and 'governor_s_statement' compare equal."""
+    """'Governor's Statement.pdf' and 'governor_s_statement' compare equal."""
     text = re.sub(r"\.pdf$", "", (text or "").strip(), flags=re.I)
     return re.sub(r"[^a-z0-9]", "", text.lower())
 
@@ -120,14 +78,12 @@ def parse_pages(text):
 
 
 def check_not_damaged(path, raw):
-    """Excel 'Save as CSV' breaks this file: it puts each line in quotes and cuts it at every
-    comma. That cannot be repaired, so stop with a clear message. (A wrong encoding such as
-    'â‚¹' instead of the rupee sign IS repaired: see fix_encoding.)"""
+    """Excel 'Save as CSV' puts every line in quotes and cuts it at commas: stop clearly."""
     lines = [l for l in raw.splitlines() if l.strip()]
     wrapped = sum(1 for l in lines if l.startswith('"') and "\t" in l)
     if lines and wrapped > len(lines) / 2:
         sys.exit(f"{path} looks DAMAGED (saved by Excel: every line is in quotes and cut at commas).\n"
-                 f"Put the original qa_test_set.csv back. To look at it, use Notepad or VS Code.")
+                 f"Put the original file back. To look at it, use Notepad or VS Code.")
 
 
 def fix_encoding(raw):
@@ -144,36 +100,26 @@ def read_csv_rows(path):
     data = path.read_bytes()
     try:
         raw = data.decode("utf-8-sig")
-    except UnicodeDecodeError:                          # saved as ANSI by Notepad / Excel
+    except UnicodeDecodeError:
         raw = data.decode("cp1252", errors="replace")
     raw = fix_encoding(raw)
     check_not_damaged(path, raw)
     delimiter = "\t" if raw.count("\t") > raw.count(",") / 3 else ","
-    rows = list(csv.reader(raw.splitlines(), delimiter=delimiter))
-    rows = [r for r in rows if any(c.strip() for c in r)]
-    if rows and rows[0] and rows[0][0].strip().lower() == "id":       # header row
+    rows = [r for r in csv.reader(raw.splitlines(), delimiter=delimiter) if any(c.strip() for c in r)]
+    if rows and rows[0] and rows[0][0].strip().lower() == "id":
         header = [h.strip().lower() for h in rows[0]]
         aliases = {"source": "file_name", "answer": "expected_answer", "type": "answer_type"}
         header = [aliases.get(h, h) for h in header]
         return [dict(zip(header, r)) for r in rows[1:]]
-    return [dict(zip(COLUMNS, r)) for r in rows]                       # no header: by position
+    return [dict(zip(COLUMNS, r)) for r in rows]
 
 
-def load_cases():
-    path = next((p for p in TEST_FILES if p.exists()), None)
-    if path is None:
-        sys.exit("No test file found. Put qa_test_set.csv next to eval.py, "
-                 "or run with --test=yourfile.csv")
-    if path.suffix == ".json":
-        rows = json.loads(path.read_text(encoding="utf-8"))
-        rows = [{"question": r["question"], "expected_answer": r.get("answer", ""),
-                 "file_name": r.get("source", ""), "page": r.get("page", ""),
-                 "answer_type": r.get("type", "")} for r in rows]
-    else:
-        rows = read_csv_rows(path)
-
+def load_cases(path=None):
+    path = Path(path or TEST_FILE)
+    if not path.exists():
+        sys.exit(f"No test file {path}. Put it next to eval.py, or use --test=yourfile.csv")
     cases = []
-    for n, r in enumerate(rows, start=1):
+    for n, r in enumerate(read_csv_rows(path), start=1):
         question = (r.get("question") or "").strip()
         if not question:
             continue
@@ -186,7 +132,8 @@ def load_cases():
             "pages": parse_pages(r.get("page")),
             "type": (r.get("answer_type") or "").strip().lower() or "paragraph",
         })
-    print(f"Test questions: {len(cases)} from {path}")
+    print(f"Test questions: {len(cases)} from {path} "
+          f"({sum(c['type'] == 'no_answer' for c in cases)} no_answer)")
     return cases
 
 
@@ -194,111 +141,134 @@ def load_cases():
 # 2. Checks
 # ---------------------------------------------------------------------------
 
-def same_doc(doc, case):
-    """Right document? First by doc_id (PDF content fingerprint: survives renaming the
-    file), then by file name."""
-    doc_id = (doc.metadata.get("doc_id") or "").lower()
+def same_doc(meta, case):
+    """Right document? By doc_id (survives renaming the PDF), else by file name."""
+    doc_id = (meta.get("doc_id") or "").lower()
     if doc_id and case["doc_id"].lower() == doc_id:
         return True
-    src = norm_name(doc.metadata.get("source"))
-    return src in {norm_name(case["file"]), norm_name(case["doc_id"])} - {""}
+    return norm_name(meta.get("source")) in {norm_name(case["file"]), norm_name(case["doc_id"])} - {""}
 
 
-def print_doc_ids():
-    """python eval.py --ids : the doc_id of every file in the database (for new test questions)."""
-    data = get_vector_db().get(include=["metadatas"])
-    ids = {}
-    for m in data["metadatas"]:
-        ids[m.get("source", "?")] = m.get("doc_id", "") or "(rebuild: python app.py --rebuild)"
-    print(f"{'doc_id':<14} file")
-    for source, doc_id in sorted(ids.items()):
-        print(f"{doc_id:<14} {source}")
-
-
-def is_hit(doc, case):
-    """Right file AND one of the expected pages."""
+def is_hit(meta, case):
+    """Right document AND one of the expected pages (a chunk covers page .. page_end)."""
     try:
-        page = int(doc.metadata.get("page"))
-        page_end = int(doc.metadata.get("page_end") or page)
+        page = int(meta.get("page"))
+        page_end = int(meta.get("page_end") or page)
     except (TypeError, ValueError):
         return False
-    # Fix 6: a chunk covers pages page..page_end (a table on pages 2-3 counts for
-    # both). Old databases without page_end: allow the next page as well.
-    if "page_end" not in doc.metadata:
-        page_end = page + 1
-    return same_doc(doc, case) and any(page <= p <= page_end for p in case["pages"])
+    return same_doc(meta, case) and any(page <= p <= page_end for p in case["pages"])
 
 
-def run_label():
-    parts = [CHUNK_STRATEGY]
-    parts += [name for name, on in (("hybrid", USE_HYBRID), ("rerank", USE_RERANK),
-                                    ("rewrite", USE_REWRITE)) if on]
-    if getattr(app, "SEARCH_SCOPE", "all") != "all":
-        parts.append(app.SEARCH_SCOPE)
-    if MIN_RELEVANCE:
-        parts.append(f"cutoff{MIN_RELEVANCE}")
-    return "+".join(parts)
+NUMBER = re.compile(r"\d[\d,]*(?:\.\d+)?")
+EMAIL_OR_URL = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+|https?://\S+", re.I)
 
 
-def test_file():
-    return next((p for p in TEST_FILES if p.exists()), None)
+def key_facts(text):
+    """The checkable facts of an expected answer (review M7): its numbers, amounts, dates and
+    e-mail / web addresses. 'Rs 20,000' -> '20000', '11.5 per cent' -> '11.5'."""
+    facts = {f.lower().rstrip(".,)") for f in EMAIL_OR_URL.findall(text or "")}
+    clean = EMAIL_OR_URL.sub(" ", text or "")
+    for n in NUMBER.findall(clean):
+        n = n.replace(",", "").rstrip(".")
+        if n:
+            facts.add(n)
+    return facts
 
 
-def run_settings(vector_db):
-    """Day 4 #2: everything needed to tell runs apart later."""
-    path = test_file()
-    chat_model = getattr(app, "CHAT_MODEL", "")
-    return {
-        "strategy": CHUNK_STRATEGY,
-        "hybrid": USE_HYBRID, "rerank": USE_RERANK, "rewrite": USE_REWRITE,
-        "scope": getattr(app, "SEARCH_SCOPE", "all"),
-        "eval_k": EVAL_K, "answer_k": answer_k(),
-        "chunk_size": getattr(app, "CHUNK_SIZE", ""), "chunk_overlap": getattr(app, "CHUNK_OVERLAP", ""),
-        "db_version": getattr(app, "DB_VERSION", ""),
-        "chunks_in_db": vector_db._collection.count(),
-        "embed_model": getattr(app, "EMBED_MODEL", ""),
-        "chat_model": f"{getattr(app, 'LLM_PROVIDER', 'ollama')}:{chat_model}",
-        "min_relevance": MIN_RELEVANCE,
-        "include_annual_reports": getattr(app, "INCLUDE_ANNUAL_REPORTS", ""),
-        "test_file": path.name if path else "",
-        "test_file_md5": hashlib.md5(path.read_bytes()).hexdigest()[:8] if path else "",
-    }
+def fact_score(expected, answer):
+    """(found, total) of the expected answer's key facts in the bot's answer. total 0 = no facts."""
+    facts = key_facts(expected)
+    if not facts:
+        return 0, 0
+    have = key_facts(answer)
+    low = (answer or "").lower()
+    found = sum(1 for f in facts if f in have or ("@" in f and f in low))
+    return found, len(facts)
 
 
 # ---------------------------------------------------------------------------
-# 3. Run every question
+# 3. Setups
+# ---------------------------------------------------------------------------
+
+def current_setup():
+    return {"strategy": app.CHUNK_STRATEGY, "hybrid": app.USE_HYBRID, "rerank": app.USE_RERANK,
+            "rewrite": app.USE_REWRITE, "synonyms": app.USE_SYNONYMS, "stemming": app.USE_STEMMING,
+            "doc_focus": app.DOC_FOCUS}
+
+
+def use_setup(s):
+    app.CHUNK_STRATEGY, app.USE_HYBRID, app.USE_RERANK, app.USE_REWRITE = (
+        s["strategy"], s["hybrid"], s["rerank"], s["rewrite"])
+    app.USE_SYNONYMS, app.USE_STEMMING, app.DOC_FOCUS = s["synonyms"], s["stemming"], s["doc_focus"]
+
+
+def label_of(s):
+    parts = [s["strategy"]] + [n for n in ("hybrid", "rerank", "rewrite") if s[n]]
+    parts += ["synonyms"] if s["synonyms"] else []
+    parts += [f"-{n}" for n, key in (("stemming", "stemming"), ("docfocus", "doc_focus")) if not s[key]]
+    if app.SEARCH_SCOPE != "all":
+        parts.append(app.SEARCH_SCOPE)
+    if app.MIN_RELEVANCE:
+        parts.append(f"cutoff{app.MIN_RELEVANCE}")
+    return "+".join(parts).replace("+-", "-")
+
+
+def run_settings(s, vector_db=None, chunks=""):
+    md5 = hashlib.md5(TEST_FILE.read_bytes()).hexdigest()[:8] if TEST_FILE.exists() else ""
+    order = ("strategy", "hybrid", "rerank", "rewrite", "synonyms", "stemming", "doc_focus")
+    return {**{k: s[k] for k in order}, "scope": app.SEARCH_SCOPE, "eval_k": EVAL_K, "answer_k": app.TOP_K,
+            "retrieval_only": RETRIEVAL_ONLY,
+            "chunk_size": app.CHUNK_SIZE, "chunk_overlap": app.CHUNK_OVERLAP,
+            "db_version": app.DB_VERSION,
+            "chunks_in_db": vector_db._collection.count() if vector_db is not None else chunks,
+            "embed_model": app.EMBED_MODEL, "chat_model": f"ollama:{app.CHAT_MODEL}",
+            "min_relevance": app.MIN_RELEVANCE,
+            "include_annual_reports": app.INCLUDE_ANNUAL_REPORTS,
+            "test_file": TEST_FILE.name, "test_file_md5": md5}
+
+
+# ---------------------------------------------------------------------------
+# 4. Run every question
 # ---------------------------------------------------------------------------
 
 def run_questions(vector_db, cases):
     details = []
     for n, case in enumerate(cases, start=1):
-        docs = retrieve(vector_db, case["question"], k=EVAL_K)        # scored at the SAME k
-        used = docs[:answer_k()]                                      # what the chatbot answers from
-        answer = generate_answer(case["question"], used) if used else "I could not find this in the documents."
-        row = {"case": case, "docs": docs, "used": used, "answer": answer}
+        t0 = time.perf_counter()
+        docs = app.retrieve(vector_db, case["question"], top_k=EVAL_K)     # scored at the SAME k
+        t1 = time.perf_counter()
+        used = docs[:app.TOP_K]                                            # what the bot answers from
+        if RETRIEVAL_ONLY:
+            answer = ""
+        else:
+            answer = (app.generate_answer(case["question"], used) if used
+                      else "I could not find this in the documents.")
+        t2 = time.perf_counter()
+        row = {"case": case, "docs": docs, "used": used, "answer": answer,
+               "sec_retrieval": t1 - t0, "sec_answer": t2 - t1}
         try:
-            row["score"] = top_relevance(vector_db, case["question"])   # for the cut-off advice
+            row["score"] = app.top_relevance(vector_db, case["question"])  # for the cut-off advice
         except Exception:
             row["score"] = None
 
         if case["type"] == "no_answer":
-            row["refused"] = bool(NOT_FOUND.search(answer))
-            status = "OK (refused)" if row["refused"] else "WRONG (answered)"
+            row["refused"] = None if RETRIEVAL_ONLY else bool(NOT_FOUND.search(answer))
+            status = ("(no answer generated)" if row["refused"] is None
+                      else "OK (refused)" if row["refused"] else "WRONG (answered)")
         else:
-            row["rank"] = next((i for i, d in enumerate(docs, start=1) if is_hit(d, case)), None)
-            row["doc_rank"] = next((i for i, d in enumerate(docs, start=1) if same_doc(d, case)), None)
-            status = (f"HIT @{row['rank']}" if row["rank"]
-                      else "DOC ONLY" if row["doc_rank"] else "MISS")
-        print(f"  [{n}/{len(cases)}] {case['id']:<5} {case['type']:<13} {status:<16} {case['question'][:55]}")
+            row["rank"] = next((i for i, d in enumerate(docs, start=1) if is_hit(d.metadata, case)), None)
+            row["doc_rank"] = next((i for i, d in enumerate(docs, start=1) if same_doc(d.metadata, case)), None)
+            row["facts"] = fact_score(case["answer"], answer) if not RETRIEVAL_ONLY else (0, 0)
+            status = (f"HIT @{row['rank']}" if row["rank"] else "DOC ONLY" if row["doc_rank"] else "MISS")
+        print(f"  [{n}/{len(cases)}] {case['id']:<5} {case['type']:<13} {status:<18} "
+              f"{row['sec_retrieval'] + row['sec_answer']:5.1f}s  {case['question'][:50]}")
         details.append(row)
     return details
 
 
 def suggest_cutoff(details):
     """MIN_RELEVANCE advice: real questions should score ABOVE it, no_answer ones BELOW.
-    Day 4 #3: tuned on the DEV half only (questions 1, 3, 5, ...). The other half is
-    untouched, so judge the cut-off on it: a cut-off tuned on the questions you score
-    makes the results look better than they are."""
+    Tuned on the DEV half only (questions 1, 3, 5, ...) and checked on the other half."""
     dev = details[0::2]
     real = [d["score"] for d in dev if d["case"]["type"] != "no_answer" and d.get("score") is not None]
     none = [d["score"] for d in dev if d["case"]["type"] == "no_answer" and d.get("score") is not None]
@@ -307,14 +277,14 @@ def suggest_cutoff(details):
     lowest_real, highest_none = min(real), max(none)
     if highest_none < lowest_real:
         cut = (highest_none + lowest_real) / 2
-        held = details[1::2]                                       # never used for tuning
+        held = details[1::2]
         ok = sum(1 for d in held if d.get("score") is not None
                  and (d["score"] >= cut) == (d["case"]["type"] != "no_answer"))
-        return (f"  Suggested MIN_RELEVANCE  : {cut:.2f}  (tuned on the dev half: no_answer max "
-                f"{highest_none:.2f} < real min {lowest_real:.2f})\n"
+        return (f"  Suggested MIN_RELEVANCE  : {cut:.2f}  (dev half: no_answer max {highest_none:.2f} "
+                f"< real min {lowest_real:.2f})\n"
                 f"  ...on the other half     : {ok}/{len(held)} questions on the right side of {cut:.2f}")
-    return (f"  MIN_RELEVANCE advice     : no clean cut (no_answer max {highest_none:.2f}, "
-            f"real min {lowest_real:.2f}). Keep 0 and let the LLM refuse.")
+    return (f"  MIN_RELEVANCE advice     : no clean cut on the dev half (no_answer max {highest_none:.2f}, "
+            f"real min {lowest_real:.2f}). Keep 0 and let the model refuse.")
 
 
 def score(details):
@@ -324,20 +294,23 @@ def score(details):
     if answerable:
         for k in (1, 3):
             s[f"hit@{k}"] = sum(1 for d in answerable if d["rank"] and d["rank"] <= k) / len(answerable)
-        s["hit_rate"] = sum(1 for d in answerable if d["rank"]) / len(answerable)   # hit@EVAL_K
+        s["hit_rate"] = sum(1 for d in answerable if d["rank"]) / len(answerable)
         s["mrr"] = sum(1 / d["rank"] for d in answerable if d["rank"]) / len(answerable)
         s["doc_hit_rate"] = sum(1 for d in answerable if d["doc_rank"]) / len(answerable)
-        s["by_type"] = {}
-        for t in sorted({d["case"]["type"] for d in answerable}):
-            group = [d for d in answerable if d["case"]["type"] == t]
-            s["by_type"][t] = (sum(1 for d in group if d["rank"]), len(group))
-    if no_answer:
+        with_facts = [d for d in answerable if d["facts"][1]]
+        if with_facts and not RETRIEVAL_ONLY:
+            s["answer_correct"] = sum(d["facts"][0] / d["facts"][1] for d in with_facts) / len(with_facts)
+        s["by_type"] = {t: (sum(1 for d in answerable if d["case"]["type"] == t and d["rank"]),
+                            sum(1 for d in answerable if d["case"]["type"] == t))
+                        for t in sorted({d["case"]["type"] for d in answerable})}
+    if no_answer and not RETRIEVAL_ONLY:
         s["no_answer_acc"] = sum(1 for d in no_answer if d["refused"]) / len(no_answer)
+    s["sec_per_q"] = sum(d["sec_retrieval"] + d["sec_answer"] for d in details) / max(len(details), 1)
     return s
 
 
 # ---------------------------------------------------------------------------
-# 4. RAGAS: faithfulness + answer relevance (answerable questions only)
+# 5. RAGAS: faithfulness + answer relevance (separate venv)
 # ---------------------------------------------------------------------------
 
 def score_ragas(details):
@@ -350,228 +323,392 @@ def score_ragas(details):
                 "retrieved_contexts": [doc.page_content for doc in d["used"]],
                 "reference": d["case"]["answer"]}
                for d in details if d["case"]["type"] != "no_answer" and d["docs"]]
-    result = evaluate(
-        dataset=EvaluationDataset.from_list(samples),
-        metrics=[Faithfulness(), ResponseRelevancy()],
-        llm=LangchainLLMWrapper(llm),                       # Day 4 #4: the SAME model grades its answers
-        embeddings=LangchainEmbeddingsWrapper(embeddings),
-        run_config=RunConfig(max_workers=2, timeout=300),   # gentle: avoids port errors
-    )
+    result = evaluate(dataset=EvaluationDataset.from_list(samples),
+                      metrics=[Faithfulness(), ResponseRelevancy()],
+                      llm=LangchainLLMWrapper(app.llm),       # the SAME model grades its answers
+                      embeddings=LangchainEmbeddingsWrapper(app.embeddings),
+                      run_config=RunConfig(max_workers=2, timeout=300))
     df = result.to_pandas()
     return df["faithfulness"].mean(), df["answer_relevancy"].mean(), df
 
 
 # ---------------------------------------------------------------------------
-# 5. Save
+# 6. Save
 # ---------------------------------------------------------------------------
 
+def details_path(label, test_file=None, retrieval_only=None):
+    """A retrieval-only run gets its own file, so it never overwrites a run WITH answers."""
+    stem = Path(test_file or TEST_FILE).stem
+    ro = RETRIEVAL_ONLY if retrieval_only is None else retrieval_only
+    suffix = "_retrieval-only" if ro and label != "bm25-pages" else ""
+    return Path(f"eval_details_{stem}_{label.replace('+', '_')}{suffix}.csv")
+
+
+DETAIL_COLUMNS = ["id", "type", "question", "expected_file", "expected_pages", "result", "rank",
+                  "retrieved (file p.page)", "bot_answer", "expected_answer", "key_facts",
+                  "seconds", "faithfulness", "answer_relevance", "top_relevance_score"]
+
+
 def save_details(label, details, ragas_df=None):
-    path = Path(f"eval_details_{label.replace('+', '_')}.csv")
+    path = details_path(label)
     ragas_rows = iter(ragas_df.to_dict("records")) if ragas_df is not None else None
     with path.open("w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
-        w.writerow(["id", "type", "question", "expected_file", "expected_pages", "result",
-                    "rank", "retrieved (file p.page)", "bot_answer", "expected_answer",
-                    "faithfulness", "answer_relevance", "top_relevance_score"])
+        w.writerow(DETAIL_COLUMNS)
         for d in details:
             c = d["case"]
             got = " | ".join(f"{doc.metadata.get('source')} p.{doc.metadata.get('page')}" for doc in d["docs"])
+            faith = rel = facts = rank = ""
             if c["type"] == "no_answer":
-                result, rank, faith, rel = ("refused OK" if d["refused"] else "ANSWERED (wrong)"), "", "", ""
+                result = ("not generated" if d["refused"] is None
+                          else "refused OK" if d["refused"] else "ANSWERED (wrong)")
             else:
                 result = "hit" if d["rank"] else "doc only" if d["doc_rank"] else "miss"
                 rank = d["rank"] or ""
-                faith = rel = ""
+                if d["facts"][1]:
+                    facts = f"{d['facts'][0]}/{d['facts'][1]}"
                 if ragas_rows is not None and d["docs"]:
                     r = next(ragas_rows, {})
                     faith, rel = r.get("faithfulness", ""), r.get("answer_relevancy", "")
             w.writerow([c["id"], c["type"], c["question"], c["file"],
                         ", ".join(map(str, sorted(c["pages"]))), result, rank, got,
-                        d["answer"], c["answer"], faith, rel,
+                        d["answer"], c["answer"], facts,
+                        f"{d['sec_retrieval'] + d['sec_answer']:.1f}", faith, rel,
                         f"{d['score']:.3f}" if d.get("score") is not None else ""])
     return path
 
 
 SUMMARY_COLUMNS = ["time", "setup", "questions", "hit@1", "hit@3", "hit@k", "mrr@k", "doc_hit@k",
-                   "no_answer_acc", "faithfulness", "answer_relevance", "ragas_judge"]
+                   "answer_correct", "no_answer_acc", "sec_per_q", "faithfulness", "answer_relevance",
+                   "ragas_judge"]
 
 
 def save_summary(label, s, settings, faithfulness="", relevance=""):
-    """Day 4 #2: one row per run, WITH its settings, so runs can be told apart later."""
+    """One row per run, WITH its settings, so runs can be told apart later."""
     header = SUMMARY_COLUMNS + list(settings)
     if RESULTS_FILE.exists():
         with RESULTS_FILE.open(encoding="utf-8-sig") as f:
             old_header = next(csv.reader(f), [])
-        if old_header != header:                       # old format: keep it, start a new file
-            old = RESULTS_FILE.with_name(f"eval_results_old_{datetime.now():%Y%m%d_%H%M}.csv")
+        if set(old_header) != set(header):             # other columns: keep it aside, start a new file
+            old = RESULTS_FILE.with_name(f"eval_results_old_{datetime.now():%Y%m%d_%H%M%S}.csv")
             RESULTS_FILE.rename(old)
             print(f"(old eval_results.csv had other columns: kept as {old.name})")
+        else:
+            header = old_header                        # same columns: keep the file's order
     new_file = not RESULTS_FILE.exists()
     fmt = lambda x: f"{x:.3f}" if isinstance(x, float) else x
+    row = {"time": datetime.now().strftime("%Y-%m-%d %H:%M"), "setup": label,
+           "questions": s["answerable"] + s["no_answer"],
+           "hit@1": fmt(s.get("hit@1", "")), "hit@3": fmt(s.get("hit@3", "")),
+           "hit@k": fmt(s.get("hit_rate", "")), "mrr@k": fmt(s.get("mrr", "")),
+           "doc_hit@k": fmt(s.get("doc_hit_rate", "")), "answer_correct": fmt(s.get("answer_correct", "")),
+           "no_answer_acc": fmt(s.get("no_answer_acc", "")), "sec_per_q": f"{s['sec_per_q']:.1f}",
+           "faithfulness": fmt(faithfulness), "answer_relevance": fmt(relevance),
+           "ragas_judge": settings["chat_model"] if faithfulness != "" else "", **settings}
     with RESULTS_FILE.open("a", newline="", encoding="utf-8-sig") as f:
-        w = csv.writer(f)
+        w = csv.DictWriter(f, fieldnames=header)
         if new_file:
-            w.writerow(header)
-        w.writerow([datetime.now().strftime("%Y-%m-%d %H:%M"), label,
-                    s["answerable"] + s["no_answer"], fmt(s.get("hit@1", "")), fmt(s.get("hit@3", "")),
-                    fmt(s.get("hit_rate", "")), fmt(s.get("mrr", "")), fmt(s.get("doc_hit_rate", "")),
-                    fmt(s.get("no_answer_acc", "")), fmt(faithfulness), fmt(relevance),
-                    settings["chat_model"] if faithfulness != "" else ""]
-                   + [settings[c] for c in settings])
+            w.writeheader()
+        w.writerow(row)
 
 
-def write_report():
-    """Day 5: the evidence. eval_report.md = every run, and the change against the baseline
-    (same strategy, no hybrid / rerank / rewrite) of the same k and test file."""
-    if not RESULTS_FILE.exists():
-        sys.exit("No eval_results.csv yet: run eval.py first.")
-    with RESULTS_FILE.open(encoding="utf-8-sig") as f:
-        rows = list(csv.DictReader(f))
-    if not rows or "hit@k" not in rows[0]:
-        sys.exit("eval_results.csv is in the old format: run the evals again with this eval.py.")
-    latest = {}
-    for r in rows:                                     # last run of each setup wins
-        latest[(r["setup"], r["eval_k"], r["test_file_md5"])] = r
-
-    def base_of(r):
-        for b in latest.values():
-            if (b["strategy"] == r["strategy"] and b["eval_k"] == r["eval_k"]
-                    and b["test_file_md5"] == r["test_file_md5"] and b["scope"] == r["scope"]
-                    and b["hybrid"] == b["rerank"] == b["rewrite"] == "False"
-                    and b["min_relevance"] in ("0", "0.0")):
-                return b
-        return None
-
-    def cell(r, col, base):
-        v = r.get(col, "")
-        if not v or base is None or base is r or not base.get(col):
-            return v
-        d = float(v) - float(base[col])
-        return f"{v} ({d:+.3f})"
-
-    k = rows[-1]["eval_k"]
-    lines = ["# Evaluation results", "",
-             f"All setups scored at the same k = {k} on `{rows[-1]['test_file']}` "
-             f"(md5 {rows[-1]['test_file_md5']}). In brackets: change vs. the baseline of the same "
-             f"chunking strategy (no hybrid / re-rank / rewrite, no cut-off).", "",
-             "| Setup | Hit@1 | Hit@3 | Hit@k | MRR@k | Doc hit@k | No-answer refused | Faithfulness | Answer relevance |",
-             "|---|---|---|---|---|---|---|---|---|"]
-    for r in sorted(latest.values(), key=lambda r: (r["strategy"], r["setup"])):
-        b = base_of(r)
-        lines.append("| " + " | ".join([r["setup"]] + [cell(r, c, b) for c in
-                     ("hit@1", "hit@3", "hit@k", "mrr@k", "doc_hit@k", "no_answer_acc",
-                      "faithfulness", "answer_relevance")]) + " |")
-    judges = {r["ragas_judge"] for r in latest.values() if r.get("ragas_judge")}
-    if judges:
-        lines += ["", f"Note: faithfulness and answer relevance were graded by {', '.join(sorted(judges))}, "
-                      "the same model that writes the answers. A small model grading itself can be "
-                      "too generous, so treat these two scores as rough."]
-    lines += ["", "Settings of each run (chunk size, models, cut-off, test file) are in eval_results.csv."]
-    Path("eval_report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
-    print("\n".join(lines))
-    print("\nSaved: eval_report.md")
-
-
-def use_setup(strategy, hybrid, rerank, rewrite):
-    """Switch eval.py AND app.py to one setup (used by --all to run several in one go)."""
-    global CHUNK_STRATEGY, USE_HYBRID, USE_RERANK, USE_REWRITE
-    CHUNK_STRATEGY, USE_HYBRID, USE_RERANK, USE_REWRITE = strategy, hybrid, rerank, rewrite
-    app.CHUNK_STRATEGY, app.USE_HYBRID, app.USE_RERANK, app.USE_REWRITE = strategy, hybrid, rerank, rewrite
-
-
-def run_one(cases):
-    """Run ONE setup: print the scores, save eval_results.csv + eval_details_<setup>.csv."""
-    label = run_label()
-    print(f"\nSetup: {label}\n")
-    vector_db = get_vector_db(strategy=CHUNK_STRATEGY)
-    settings = run_settings(vector_db)
-    details = run_questions(vector_db, cases)
-    s = score(details)
-
-    faithfulness = relevance = ""
-    ragas_df = None
-    if "--ragas" in sys.argv:
-        print("\nRAGAS: grading answers (slow)...")
-        faithfulness, relevance, ragas_df = score_ragas(details)
-
-    print("\n" + "=" * 55)
+def print_scores(label, s, settings, faithfulness=""):
+    print("\n" + "=" * 60)
     print(f"  Setup                  : {label}")
-    print(f"  Scored at k            : {EVAL_K} for every setup (the chatbot answers from {answer_k()})")
+    print(f"  Scored at k            : {EVAL_K} (the chatbot answers from {app.TOP_K})")
     if "hit_rate" in s:
-        print(f"  Hit@1 / Hit@3 (page)   : {s['hit@1']:.3f} / {s['hit@3']:.3f}")   
+        print(f"  Hit@1 / Hit@3 (page)   : {s['hit@1']:.3f} / {s['hit@3']:.3f}")
         print(f"  Hit@{EVAL_K} (page)           : {s['hit_rate']:.3f}   ({s['answerable']} questions)")
         print(f"  MRR@{EVAL_K}                  : {s['mrr']:.3f}")
         print(f"  Right document @{EVAL_K}      : {s['doc_hit_rate']:.3f}")
+        if "answer_correct" in s:
+            print(f"  Answer key facts found : {s['answer_correct']:.3f}")
         for t, (hits, total) in s["by_type"].items():
             print(f"     {t:<20}: {hits}/{total}")
     if "no_answer_acc" in s:
         print(f"  No-answer refused      : {s['no_answer_acc']:.3f}   ({s['no_answer']} questions)")
+    print(f"  Seconds per question   : {s['sec_per_q']:.1f}")
     if faithfulness != "":
-        print(f"  Faithfulness           : {faithfulness:.3f}")
-        print(f"  Answer relevance       : {relevance:.3f}")
-        print(f"  (graded by {settings['chat_model']}, the same model that wrote the answers:"
-              f" treat as rough)")
+        print(f"  (RAGAS graded by {settings['chat_model']}, the same model: treat as rough)")
+
+
+# ---------------------------------------------------------------------------
+# 7. Runs
+# ---------------------------------------------------------------------------
+
+def run_one(cases, setup=None):
+    setup = setup or current_setup()
+    use_setup(setup)
+    label = label_of(setup)
+    print(f"\nSetup: {label}   ({TEST_FILE.name})\n")
+    vector_db = app.get_vector_db(strategy=setup["strategy"])
+    settings = run_settings(setup, vector_db)
+    details = run_questions(vector_db, cases)
+    s = score(details)
+    faithfulness = relevance = ""
+    ragas_df = None
+    if "--ragas" in sys.argv and not RETRIEVAL_ONLY:
+        print("\nRAGAS: grading answers (slow)...")
+        faithfulness, relevance, ragas_df = score_ragas(details)
+    print_scores(label, s, settings, faithfulness)
     advice = suggest_cutoff(details)
     if advice:
-        print(advice + (f"   [now: {MIN_RELEVANCE}]" if MIN_RELEVANCE else ""))
-    print("=" * 55)
-
+        print(advice)
+    print("=" * 60)
     save_summary(label, s, settings, faithfulness, relevance)
-    details_file = save_details(label, details, ragas_df)
-    print(f"Saved: {RESULTS_FILE} (summary) and {details_file} (every question)")
-    return label, s, details_file
+    path = save_details(label, details, ragas_df)
+    print(f"Saved: {RESULTS_FILE} and {path}")
+    return label, s, path
 
 
-ALL_FILE = Path("eval_details_all.csv")
+def setups_for_all():
+    """--all: the 3 strategies with the flags given. --all --setups: each strategy x
+    (base, +hybrid, +hybrid+rerank, +hybrid+rerank+rewrite), plus 3 ablation rows (H1 / M5)."""
+    full = "--setups" in sys.argv or "--setup" in sys.argv
+    base = dict(hybrid=False, rerank=False, rewrite=False, synonyms=False, stemming=True, doc_focus=True)
+    if full:
+        variants = [{}, {"hybrid": True}, {"hybrid": True, "rerank": True},
+                    {"hybrid": True, "rerank": True, "rewrite": True}]
+    else:
+        cur = current_setup()
+        variants = [{k: v for k, v in cur.items() if k != "strategy"}]
+    out = [dict(base, strategy=st, **v) for st in ("recursive", "fixed", "semantic") for v in variants]
+    if full:
+        out += [dict(base, strategy="recursive", hybrid=True, doc_focus=False),     # DOC_FOCUS?
+                dict(base, strategy="recursive", hybrid=True, stemming=False),      # stemming?
+                dict(base, strategy="recursive", hybrid=True, synonyms=True)]       # synonyms?
+    return out
 
 
 def run_all(cases):
-    """--all : recursive, fixed AND semantic (with the flags you gave, e.g. --hybrid).
-    --all --setups : each strategy x (baseline, +hybrid, +hybrid+rerank) = 9 runs (slow).
-    Every question of every run goes into ONE file: eval_details_all.csv."""
-    flags = [(USE_HYBRID, USE_RERANK, USE_REWRITE)]
-    if "--setups" in sys.argv:
-        flags = [(False, False, False), (True, False, False), (True, True, False)]
-    runs, rows, header = [], [], None
-    for strategy in ("recursive", "fixed", "semantic"):
-        if not app.is_built(strategy):
-            print(f"\n(skipped {strategy}: database not built. Run: python app.py --strategy={strategy})")
+    runs, rows = [], []
+    for setup in setups_for_all():
+        if not app.is_built(setup["strategy"]):
+            print(f"\n(skipped {setup['strategy']}: database not built. "
+                  f"Run: python app.py --strategy={setup['strategy']})")
             continue
-        for hybrid, rerank, rewrite in flags:
-            use_setup(strategy, hybrid, rerank, rewrite)
-            label, s, details_file = run_one(cases)
-            runs.append((label, s))
-            with details_file.open(encoding="utf-8-sig") as f:
-                part = list(csv.reader(f))
-            header = ["setup"] + part[0]
-            rows += [[label] + r for r in part[1:]]
+        label, s, path = run_one(cases, setup)
+        runs.append((label, s))
+        with path.open(encoding="utf-8-sig") as f:
+            part = list(csv.reader(f))
+        rows += [[label] + r for r in part[1:]]
     if not runs:
         sys.exit("No database is built. Run: python app.py")
-
-    with ALL_FILE.open("w", newline="", encoding="utf-8-sig") as f:
+    all_file = Path(f"eval_details_{TEST_FILE.stem}_all{'_retrieval-only' if RETRIEVAL_ONLY else ''}.csv")
+    with all_file.open("w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
-        w.writerow(header)
+        w.writerow(["setup"] + DETAIL_COLUMNS)
         w.writerows(rows)
-
-    print("\n" + "=" * 72)
-    print(f"  {'setup':<28}{'Hit@1':>8}{'Hit@3':>8}{f'Hit@{EVAL_K}':>8}{f'MRR@{EVAL_K}':>8}{'Doc@k':>8}")
+    print("\n" + "=" * 84)
+    print(f"  {'setup':<36}{'Hit@1':>8}{'Hit@3':>8}{f'Hit@{EVAL_K}':>8}{f'MRR@{EVAL_K}':>8}"
+          f"{'Doc@k':>8}{'s/q':>7}")
     for label, s in runs:
         if "hit_rate" in s:
-            print(f"  {label:<28}{s['hit@1']:>8.3f}{s['hit@3']:>8.3f}{s['hit_rate']:>8.3f}"
-                  f"{s['mrr']:>8.3f}{s['doc_hit_rate']:>8.3f}")
-    print("=" * 72)
-    print(f"Saved: {ALL_FILE} ({len(rows)} rows: every question of every setup, column 'setup')")
+            print(f"  {label:<36}{s['hit@1']:>8.3f}{s['hit@3']:>8.3f}{s['hit_rate']:>8.3f}"
+                  f"{s['mrr']:>8.3f}{s['doc_hit_rate']:>8.3f}{s['sec_per_q']:>7.1f}")
+    print("=" * 84)
+    print(f"Saved: {all_file} ({len(rows)} rows)")
+
+
+# ---------------------------------------------------------------------------
+# 8. The floor: plain BM25 over whole pages (review "Evaluation integrity")
+# ---------------------------------------------------------------------------
+
+PDF_FOLDER = Path("raw_pdfs")
+
+
+def page_texts():
+    """{(file, doc_id, page): text} of every PAGE of every PDF in raw_pdfs/, read straight from
+    the PDF (the reviewer's method). Annual reports are left out, as in the index."""
+    import pymupdf
+    skip, doc_ids = set(), {}
+    for f in app.JSON_FOLDER.glob("*.json"):           # doc_type + doc_id come from clean_pdfs.py
+        data = json.loads(f.read_text(encoding="utf-8"))
+        doc_ids[data["file_name"]] = (data.get("file_hash") or "")[:12]
+        if data.get("metadata", {}).get("doc_type") == "annual_report" and not app.INCLUDE_ANNUAL_REPORTS:
+            skip.add(data["file_name"])
+    pages = {}
+    for pdf in sorted(PDF_FOLDER.glob("*.pdf")):
+        if pdf.name in skip or pdf.name not in doc_ids:
+            continue
+        with pymupdf.open(str(pdf)) as doc:
+            for n, page in enumerate(doc, start=1):
+                pages[(pdf.name, doc_ids[pdf.name], n)] = page.get_text()
+    if not pages:
+        sys.exit("No PDF pages found: --bm25-pages needs raw_pdfs/ and output/json/ (run clean_pdfs.py).")
+    return pages
+
+
+def run_bm25_pages(cases):
+    """Plain BM25: lower-case words, no stemming, no synonyms, no chunking, no version filter."""
+    from rank_bm25 import BM25Okapi
+    pages = page_texts()
+    keys = list(pages)
+    plain = lambda t: re.findall(r"\w+", t.lower())
+    bm25 = BM25Okapi([plain(pages[k]) for k in keys])
+    details = []
+    for case in cases:
+        t0 = time.perf_counter()
+        scores = bm25.get_scores(plain(case["question"]))
+        top = sorted(range(len(keys)), key=scores.__getitem__, reverse=True)[:EVAL_K]
+        metas = [{"source": keys[i][0], "doc_id": keys[i][1], "page": keys[i][2], "page_end": keys[i][2]}
+                 for i in top]
+        row = {"case": case, "docs": [type("D", (), {"metadata": m, "page_content": ""}) for m in metas],
+               "used": [], "answer": "", "sec_retrieval": time.perf_counter() - t0, "sec_answer": 0.0,
+               "score": None, "facts": (0, 0)}
+        if case["type"] == "no_answer":
+            row["refused"] = None
+        else:
+            row["rank"] = next((i for i, m in enumerate(metas, start=1) if is_hit(m, case)), None)
+            row["doc_rank"] = next((i for i, m in enumerate(metas, start=1) if same_doc(m, case)), None)
+        details.append(row)
+    s = score(details)
+    s.pop("no_answer_acc", None)
+    s.pop("answer_correct", None)
+    label = "bm25-pages"
+    settings = run_settings({"strategy": "pages", "hybrid": False, "rerank": False, "rewrite": False,
+                             "synonyms": False, "stemming": False, "doc_focus": False},
+                            chunks=len(keys))
+    settings["retrieval_only"] = True
+    print_scores(label + "  (plain BM25 over whole pages: the floor to beat)", s, settings)
+    save_summary(label, s, settings)
+    print(f"Saved: {RESULTS_FILE} and {save_details(label, details)}")
+
+
+# ---------------------------------------------------------------------------
+# 9. Report: eval_report.md + README table (review Day 4 / Day 5 evidence, M8)
+# ---------------------------------------------------------------------------
+
+def _results_by_test():
+    if not RESULTS_FILE.exists():
+        sys.exit("No eval_results.csv yet: run eval.py first.")
+    with RESULTS_FILE.open(encoding="utf-8-sig") as f:
+        rows = list(csv.DictReader(f))
+    if not rows or "answer_correct" not in rows[0]:
+        sys.exit("eval_results.csv is in an old format: run the evals again with this eval.py.")
+    latest = {}
+    for r in rows:                                     # the last run of each setup wins
+        # a retrieval-only run and a run with answers are DIFFERENT rows (one never hides the other)
+        latest[(r["test_file"], r["setup"], r["eval_k"], r.get("retrieval_only", ""))] = r
+    by_test = {}
+    for (test, _, _, _), r in latest.items():
+        by_test.setdefault(test, []).append(r)
+    return by_test
+
+
+def _baseline(r, group):
+    if r["setup"] == "bm25-pages":
+        return None
+    for b in group:
+        if (b["strategy"] == r["strategy"] and b["eval_k"] == r["eval_k"]
+                and b["hybrid"] == b["rerank"] == b["rewrite"] == "False"
+                and b["synonyms"] == "False" and b["stemming"] == b["doc_focus"] == "True"
+                and b["min_relevance"] in ("0", "0.0") and b["retrieval_only"] == r["retrieval_only"]):
+            return b
+    return None
+
+
+def _wins_losses(r, base):
+    """Questions that this setup finds (hit@k) and the baseline does not, and the other way round."""
+    def hits(label):
+        path = details_path(label, r["test_file"], r.get("retrieval_only") == "True")
+        if not path.exists():
+            return None
+        with path.open(encoding="utf-8-sig") as f:
+            return {row["id"]: row["result"] == "hit" for row in csv.DictReader(f)
+                    if row["type"] != "no_answer"}
+    a, b = hits(r["setup"]), hits(base["setup"])
+    if a is None or b is None:
+        return ""
+    won = [q for q in a if a[q] and not b.get(q)]
+    lost = [q for q in a if not a[q] and b.get(q)]
+    ids = lambda qs: " ".join(qs[:8]) + (f" (+{len(qs) - 8} more)" if len(qs) > 8 else "")
+    return f"+{len(won)} {ids(won)} / -{len(lost)} {ids(lost)}".strip()
+
+
+def write_report():
+    by_test = _results_by_test()
+    cols = ("hit@1", "hit@3", "hit@k", "mrr@k", "doc_hit@k", "answer_correct", "no_answer_acc",
+            "faithfulness", "answer_relevance", "sec_per_q")
+    lines = ["# Evaluation results", "",
+             "Every setup is scored at the same k on the same questions. In brackets: change against the",
+             "baseline of the same chunking strategy (vectors only, default settings). `bm25-pages` is plain",
+             "BM25 over whole pages (no chunking, no tuning): the floor every setup must beat.",
+             "`-docfocus`, `-stemming` and `+synonyms` rows are the ablation for review items H1 / M5.",
+             "**qa_heldout.csv was never used to tune anything: judge the extras on it.**", ""]
+    readme_rows = []
+    for test, group in sorted(by_test.items(), key=lambda kv: kv[0] != "qa_test_set.csv"):
+        k = group[0]["eval_k"]
+        lines += [f"## {test} (k = {k}, md5 {group[0]['test_file_md5']}, {group[0]['questions']} questions)", "",
+                  "| Setup | Hit@1 | Hit@3 | Hit@k | MRR@k | Doc hit@k | Key facts | No-answer refused "
+                  "| Faithfulness | Answer relevance | s/question | Won / lost vs baseline (hit@k) |",
+                  "|---|---|---|---|---|---|---|---|---|---|---|---|"]
+        order = sorted(group, key=lambda r: (r["setup"] != "bm25-pages", r.get("retrieval_only") != "True",
+                                             r["strategy"], r["setup"]))
+        for r in order:
+            b = _baseline(r, group)
+            def cell(c):
+                v = r.get(c, "")
+                if not v or b is None or b is r or not b.get(c) or c == "sec_per_q":
+                    return v
+                return f"{v} ({float(v) - float(b[c]):+.3f})"
+            wl = _wins_losses(r, b) if b is not None and b is not r else ""
+            name = f"`{r['setup']}`" + (" (retrieval only)" if r.get("retrieval_only") == "True"
+                                         and r["setup"] != "bm25-pages" else "")
+            lines.append("| " + " | ".join([name] + [cell(c) for c in cols] + [wl]) + " |")
+            readme_rows.append(f"| {test} | {name} | {r.get('hit@1', '')} | {r.get('hit@3', '')} | "
+                               f"{r.get('hit@k', '')} | {r.get('mrr@k', '')} | {r.get('answer_correct', '')} | "
+                               f"{r.get('no_answer_acc', '')} | {r.get('faithfulness', '')} | "
+                               f"{r.get('answer_relevance', '')} |")
+        lines.append("")
+    lines += ["Key facts = share of the numbers, amounts, dates and e-mail addresses of the expected answer",
+              "that appear in the bot's answer (review M7). With 40 answerable questions one question is 2.5",
+              "points: read the won / lost columns, not only the averages (review M8).",
+              "Faithfulness / answer relevance = RAGAS (python eval.py ... --ragas), graded by the same",
+              "local model (qwen3:8b), so treat them as rough.", "",
+              "All settings of every run (models, chunk size, cut-off, test file md5) are in eval_results.csv."]
+    REPORT_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print("\n".join(lines))
+    print(f"\nSaved: {REPORT_FILE}")
+    _update_readme(readme_rows)
+
+
+def _update_readme(rows):
+    """Replace the table between <!-- RESULTS:START --> and <!-- RESULTS:END --> in README.md."""
+    if not README.exists():
+        return
+    text = README.read_text(encoding="utf-8")
+    start, end = "<!-- RESULTS:START -->", "<!-- RESULTS:END -->"
+    if start not in text or end not in text:
+        print("(README.md has no RESULTS markers: table not updated)")
+        return
+    table = "\n".join(["| Test set | Setup | Hit@1 | Hit@3 | Hit@5 | MRR@5 | Key facts | No-answer refused "
+                        "| Faithfulness | Answer relevance |",
+                        "|---|---|---|---|---|---|---|---|---|---|"] + rows)
+    stamp = f"_Filled by `python eval.py --report` on {datetime.now():%Y-%m-%d %H:%M}._"
+    before, rest = text.split(start, 1)
+    after = rest.split(end, 1)[1]
+    README.write_text(f"{before}{start}\n{stamp}\n\n{table}\n{end}{after}", encoding="utf-8")
+    print("README.md results table updated.")
+
+
+def print_doc_ids():
+    data = app.get_vector_db().get(include=["metadatas"])
+    ids = {m.get("source", "?"): m.get("doc_id", "") or "(rebuild: python app.py --rebuild)"
+           for m in data["metadatas"]}
+    print(f"{'doc_id':<14} file")
+    for source, doc_id in sorted(ids.items()):
+        print(f"{doc_id:<14} {source}")
 
 
 if __name__ == "__main__":
     if "--report" in sys.argv:
         write_report()
-        sys.exit()
-    if "--ids" in sys.argv:
+    elif "--ids" in sys.argv:
         print_doc_ids()
-        sys.exit()
-    cases = load_cases()
-    if "--all" in sys.argv:
-        run_all(cases)
+    elif "--bm25-pages" in sys.argv:
+        run_bm25_pages(load_cases())
+    elif "--all" in sys.argv:
+        run_all(load_cases())
     else:
-        run_one(cases)
+        run_one(load_cases())

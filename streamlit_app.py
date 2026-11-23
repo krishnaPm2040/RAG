@@ -12,6 +12,7 @@ Opens http://localhost:8501 in your browser.
 - The UI only OPENS databases. Build them first with:  python app.py
 """
 
+
 import streamlit as st
 
 import app   # your app.py: vector DB, retrieval, generation with citations
@@ -24,12 +25,11 @@ st.set_page_config(page_title="Document Chatbot", page_icon="🏦", layout="wide
 
 with st.sidebar:
     st.header("Settings")
-    strategy = st.selectbox("Chunking strategy", ["recursive", "fixed", "semantic"],
+    # Only the databases that are built
+    built = [n for n in ("recursive", "fixed", "semantic") if app.is_built(n)] or ["recursive"]
+    strategy = st.selectbox("Chunking strategy", built,
                             help="Each strategy has its own database. Build them with: python app.py")
-    scope_label = st.radio("Search in", ["All documents", "Circulars only", "Annual reports only"],
-                           help="Circulars only = annual reports are not searched.")
-    scope = {"All documents": "all", "Circulars only": "circulars",
-             "Annual reports only": "annual_reports"}[scope_label]
+    scope = "all"              # annual reports are not in the database, so no "Search in" choice
     use_hybrid = st.checkbox("Hybrid search (BM25 + vectors)", value=True)
     use_rerank = st.checkbox("Re-ranker (keeps 5 sources)", value=False,
                              help="First use downloads a small model (~90 MB).")
@@ -81,7 +81,7 @@ except SystemExit as e:                   # app.py stops with sys.exit() if outp
     st.stop()
 except Exception as e:
     st.error(f"Could not open the vector database: {e}\n\n"
-             "Is Ollama running? Did you run `ollama pull nomic-embed-text`?")
+             + "Is Ollama running? Did you run `ollama pull nomic-embed-text`?")
     st.stop()
 
 with st.sidebar:
@@ -157,8 +157,8 @@ if question:
                     "issue_date": d.metadata.get("issue_date", ""),
                     "heading": d.metadata.get("heading", ""),
                     "text": d.page_content}
-                   for i, d in enumerate(reply["results"], start=1)
-                   if not reply["cited"] or i in reply["cited"]]   # only sources the answer used
+                   for i, d in app.sources_to_show(reply["answer"], reply["results"])]
+                                                    # cited sources only; none for a refusal (L2)
         understood = reply["question_used"] if reply["question_used"] != question else ""
 
         live.markdown(safe(reply["answer"]))

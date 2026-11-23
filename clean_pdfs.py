@@ -1,4 +1,3 @@
-
 """pdf_to_clean_text.py
 ====================
 Day 1 of the RAG project: turn a folder of PDFs into a CLEAN text corpus.
@@ -98,7 +97,7 @@ from pathlib import Path
 import pdfplumber  # good at finding tables
 import pymupdf     # PyMuPDF: text with font sizes/positions, links, images, bookmarks
 import hashlib
-import fitz
+
 # ===========================================================================
 # Settings you may want to tune for your documents
 # ===========================================================================
@@ -125,14 +124,15 @@ TOC_MATCH_SHARE = 0.5        # use bookmarks only if >= 50% of them are found
 # Element 30: limits for corrupt / huge files
 MAX_SIZE_MB = 100            # bigger files are skipped
 MAX_PAGES = 800              # longer files are skipped
-PARSE_TIMEOUT_SEC = 300      # a PDF that takes longer is stopped and skipped
+PARSE_TIMEOUT_SEC = 1000      # a PDF that takes longer is stopped and skipped
 
 # Element 31: version metadata is read from the start of the document
 METADATA_HEAD_CHARS = 4000   # roughly the first page
 
 # Incremental runs: change this number whenever you change the CLEANING code.
 # Every PDF cleaned with an older number is cleaned again once.
-PIPELINE_VERSION = "2.3"   # 2.3 = annual report only by cover/title; FAQ by numbered questions
+PIPELINE_VERSION = "2.4"   # 2.4 = exact supersede match (H3), updated_on (M3)
+                           # 2.3 = annual report only by cover/title; FAQ by numbered questions; official titles
                            # 1.2 = page_end, 1.3 = cover IDs, doc types, safe dates, stale output, table symbols
                            # 1.4 = infographics: numbers are not headings, long "headings" are text
                            # 1.5 = page frames / prose boxes are not tables; safer cross-page merge
@@ -177,6 +177,7 @@ DATE_VALUE = (r"(\d{1,2}[/.-]\d{1,2}[/.-]\d{4}"                         # 02/04/
 LABELLED_DATE = re.compile(r"\b(?:Date|Dated|Issued\s+on|Date\s+of\s+issue)\b\s*[:\-]?\s*" + DATE_VALUE, re.I)
 LONE_DATE_LINE = re.compile(r"^\s*" + DATE_VALUE + r"\s*$", re.M)
 ANY_DATE = re.compile(DATE_VALUE)
+UPDATED_AS_ON = re.compile(r"\(\s*updated\s+(?:as\s+)?(?:on|upto|up\s+to)\s+" + DATE_VALUE, re.I)
 DATE_FORMATS = ["%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y",
                 "%d %B %Y", "%d %b %Y", "%B %d %Y", "%b %d %Y"]
 
@@ -1594,7 +1595,7 @@ def extract_manual_metadata(head: str) -> dict:
 def raw_cover_text(pdf_path, pages=3) -> str:
     """Plain text of the first pages + PDF metadata title, before any cleaning."""
     try:
-        doc = fitz.open(pdf_path)
+        doc = pymupdf.open(pdf_path)
         try:
             text = " ".join(doc[i].get_text() for i in range(min(pages, len(doc))))
             return (doc.metadata or {}).get("title", "") + " " + text
@@ -1627,11 +1628,17 @@ def extract_version_metadata(text: str) -> dict:
 
     supersedes = find_supersedes(text)     # whole text: often in the last paragraph
 
+    # review M3: a consolidated master direction keeps its first issue date ("July 5, 2016") but
+    # is "(Updated as on October 01, 2026)". The LATEST update date is stored too.
+    updates = [to_iso_date(m.group(1)) for m in UPDATED_AS_ON.finditer(head)]
+    updated_on = max((u for u in updates if u), default=None)
+
     return {
         "doc_type": doc_type,
         **manual,                          # model, product, brand, doc_version
         "issue_date": to_iso_date(issue_date_raw),
         "issue_date_raw": issue_date_raw,
+        "updated_on": updated_on,
         "circular_no": circular_no,
         "supersedes": supersedes,
         "superseded_by": None,
@@ -1690,15 +1697,18 @@ def link_superseded(json_dir: Path) -> int:
     links = 0
     for new_path, new_doc in docs.items():
         new_meta = new_doc["metadata"]
-        target = norm_ref(new_meta.get("supersedes"))
-        if not target:
+        # review H3: every reference on its own, compared EXACTLY. (Before: a substring test on
+        # all of them joined, so "RBI/2024-25/1" = "rbi2024251" was found inside "rbi20242512".)
+        refs = [r.strip() for r in (new_meta.get("supersedes") or "").split(";")]
+        targets = {norm_ref(r) for r in refs if r and not r.startswith("dated ")}
+        if not refs or not any(refs):
             continue
         dates = set(re.findall(r"dated (\d{4}-\d{2}-\d{2})", new_meta.get("supersedes") or ""))
         for old_path, old_doc in docs.items():
             if old_path == new_path:
                 continue
             no = norm_ref(old_doc["metadata"].get("circular_no"))
-            by_number = len(no) >= 4 and no in target
+            by_number = len(no) >= 4 and no in targets         # review H3: EXACT match
             by_date = (old_doc["metadata"].get("issue_date") in dates
                        and old_doc["metadata"].get("doc_type") == new_meta.get("doc_type"))
             if not (by_number or by_date):
@@ -2097,6 +2107,151 @@ def bad_title(text, watermarks=()) -> str:
         return "question fragment"
     if len(text) > 200:
         return "too long"
+    # 2.3: the new wrong titles the review found
+    if text[:1].islower():
+        return "sentence fragment"                            # "section (2) of section 5 of ..."
+    if re.match(r"^chapter\s+[ivxlc\d]+\b[\s\-–:.]*(?:preliminary|introduction|general|definitions|"
+                r"short\s+title\b.*)?\s*$", text, re.I):
+        return "chapter heading"                              # "Chapter I – Preliminary"
+    if (RBI_REF_NO.search(text) or re.fullmatch(r"[A-Z]{2,6}(?:[./ -][A-Za-z0-9]+)*[/.]\d[\w./-]*", text)) \
+            and len(re.findall(r"[A-Za-z]{3,}", RBI_REF_NO.sub("", text))) < 2:
+        return "circular number"                              # "RBI/DBR/2015-16/19"
+    if re.match(r"^[A-Z][.)]?\s+[A-Z][a-z]", text) and not re.match(r"^[AI]\s", text):
+        return "sub-section heading"                          # "B Scope of counterparty credit risk"
+    if re.match(r"^\d{1,3}[.)]\s", text):
+        return "numbered item"                                # "1. What is RB-IOS, 2026?"
+    if re.match(r"^note\b", text, re.I):
+        return "note"                                         # "Note: The respondent company ..."
+    if "_" in text or re.fullmatch(r"RBI\s*(?:\([^)]*\)\s*)*Direction|RBI(?:\s+\w+)?", text):
+        return "file name"                                    # "RBI (FAQ1) Direction", "RBI Issues"
+    return ""
+
+
+# ---- 2.3: the OFFICIAL title from page 1 (review: new wrong titles such as
+# "section (2) of section 5 of ...", "Chapter I – Preliminary", "B Scope of ...", "RBI/DBR/2015-16/19")
+TITLE_DIRECTION = re.compile(r"^(?:Master\s+Direction\s*[-–]\s*)?(?:Reserve\s+Bank\s+of\s+India|RBI)\s*\(", re.I)
+TITLE_DIRECTION_END = re.compile(r"\bDirections?\b[^()]*?\b(?:19|20)\d{2}\b", re.I)
+SALUTATION = re.compile(r"^(?:dear\s+)?(?:sir|madam)\b[\s/,]*(?:(?:dear\s+)?(?:sir|madam)\b)?[\s,.]*$", re.I)
+DATE_ONLY = re.compile(r"^\s*(?:\d{1,2}\s+)?(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+"
+                       r"(?:\d{1,2},?\s+)?\d{4}\s*$", re.I)
+BODY_START = re.compile(r"^(?:please|the\s|today|good\s+morning|in\s|on\s|we\s|as\s|with\s|this\s|"
+                        r"declaration|reference|\d+\.\s|\(\w{1,4}\)\s)", re.I)
+UPDATED_NOTE = re.compile(r"\s*\((?:updated|amended)\s+(?:as\s+)?(?:on|upto|up\s+to)[^)]*\)+", re.I)
+CONNECTOR_END = re.compile(r"(?:\b(?:of|for|on|and|in|the|to|by|with|under|from)|[-–,(/])\s*$", re.I)
+
+
+def page_one_lines(pdf_path, max_lines=80):
+    """[(text, size, bold)] of page 1, in reading order, empty lines dropped."""
+    out = []
+    try:
+        with pymupdf.open(str(pdf_path)) as doc:
+            if not len(doc):
+                return out
+            for block in doc[0].get_text("dict")["blocks"]:
+                for line in block.get("lines", []):
+                    spans = [sp for sp in line["spans"] if sp["text"].strip()]
+                    if not spans:
+                        continue
+                    text = re.sub(r"\s+", " ", "".join(sp["text"] for sp in spans)).strip()
+                    bold = any(sp["flags"] & 16 or "bold" in sp["font"].lower() for sp in spans)
+                    out.append((text, round(max(sp["size"] for sp in spans), 1), bold))
+                    if len(out) >= max_lines:
+                        return out
+    except Exception:
+        pass
+    return out
+
+
+def _run(lines, i, limit=3, stop_at_body=True):
+    """Join line i with the lines after it that belong to the same title: same bold style and
+    font size, or (no bold used) a line that ends in "of", "for", "-" ... and continues."""
+    text, size, bold = lines[i]
+    parts = [text]
+    for t, sz, b in lines[i + 1:i + limit]:
+        same_style = bold and b and abs(sz - size) <= 0.6
+        continues = not bold and CONNECTOR_END.search(parts[-1]) and not BODY_START.match(t)
+        if (not (same_style or continues) or (stop_at_body and BODY_START.match(t)) or DATE_ONLY.match(t)
+                or NUMBERED_QUESTION.match(t)):
+            break
+        parts.append(t)
+    return " ".join(parts)
+
+
+def _clean_title(text):
+    text = UPDATED_NOTE.sub("", text)
+    text = re.sub(r"(?<=[a-z])\((?=[A-Z])", " (", text)             # "India(Know" -> "India (Know"
+    text = re.sub(r"\s+", " ", text).strip(" ,.;:-–")
+    if text.isupper() and len(text.split()) >= 3:            # "REGULATION, SUPERVISION AND ..."
+        small = {"and", "of", "the", "for", "to", "in", "on", "with", "by", "a", "an", "be"}
+        words = [w.lower() if w.lower() in small else (w if w in {"RBI", "KYC", "NBFC", "MSME", "UCB"} else w.capitalize())
+                 for w in text.split()]
+        words[0] = words[0][:1].upper() + words[0][1:]
+        text = " ".join(words)
+    return text[:200]
+
+
+def official_title(pdf_path) -> str:
+    """The title RBI itself prints on page 1, found by the place it always has:
+      1. 'Reserve Bank of India (X) Directions, 2025'  (+ the next line when it wraps)
+      2. the subject line right after 'Dear Sir / Madam,' (letters, master circulars)
+      3. the line after the date in a press release / statement
+      4. the 'Frequently Asked Questions ...' heading of an FAQ (+ the survey name above it)
+      5. a first line in CAPITALS ('FORM OF COMPLAINT ...', chapter of a report)
+    '' when none is found (choose_title then tries its other candidates)."""
+    raw = page_one_lines(pdf_path)
+    for i, (t, _, _) in enumerate(raw):                                # 1 (raw lines: "Directions, 2026"
+        if TITLE_DIRECTION.match(t):                                   #    alone on a line is kept)
+            parts = [t]
+            for nxt, _, _ in raw[i + 1:i + 3]:
+                if TITLE_DIRECTION_END.search(" ".join(parts)) or BODY_START.match(nxt) \
+                        or re.match(r"^reserve\s+bank\s+(?:had|has)\b", nxt, re.I):
+                    break
+                parts.append(nxt)
+            return _clean_title(" ".join(parts))
+
+    keep = [i for i, (t, _, _) in enumerate(raw)                      # lines that may START a title
+            if not bad_title(t) or SALUTATION.match(t) or DATE_ONLY.match(t)]
+    texts = [raw[i][0] for i in keep]
+
+    for n, i in enumerate(keep[:-1]):                                  # 2
+        if SALUTATION.match(raw[i][0]):
+            nxt = keep[n + 1]
+            if not BODY_START.match(raw[nxt][0]) and len(raw[nxt][0]) <= 160:
+                return _clean_title(_run(raw, nxt))
+
+    for n, i in enumerate(keep[:15]):                                  # 3
+        if DATE_ONLY.match(raw[i][0]) and n + 1 < len(keep) and not BODY_START.match(raw[keep[n + 1]][0]):
+            title = _run(raw, keep[n + 1])
+            if not bad_title(title):
+                return _clean_title(title)
+
+    for i, (t, _, bold) in enumerate(raw[:30]):                       # 4
+        if re.search(r"frequently\s+asked\s+questions", t, re.I):
+            title = _run(raw, i, stop_at_body=False) if not t.rstrip().endswith(")") else t
+            title = re.sub(r"\s+(?:General\s+(?:Instructions|Information))$", "", title, flags=re.I)
+            bare = re.fullmatch(r"frequently\s+asked\s+questions\s*(?:\(FAQs?\))?", t.strip(), re.I)
+            if bare and title.strip() != t.strip():                    # "FAQs" + "Integrated Ombudsman Scheme"
+                return _clean_title(title[len(t):].strip() + " – Frequently Asked Questions")
+            before, j = [], i - 1
+            while j >= 0 and raw[j][2] == bold and not re.search(
+                    r"reserve\s+bank|department|division|mumbai|^rbi\b", raw[j][0], re.I):
+                before.insert(0, raw[j][0])
+                j -= 1
+            return _clean_title(" ".join(before) + " – " + title if before else title)
+
+    first_line = raw[0][0] if raw else ""
+    questions = [i for i, (t, _, _) in enumerate(raw[:40]) if NUMBERED_QUESTION.match(t)]
+    if len(questions) >= 2 and (NUMBERED_QUESTION.match(first_line) or re.match(r"^[A-H][.)]\s", first_line)):
+        first = questions[0]                                           # 6: FAQ with NO printed title
+        lettered = re.match(r"^[A-H][.)]\s+(.{8,120})$", raw[first - 1][0]) if first else None
+        topic = lettered.group(1) if lettered else re.sub(r"^\s*(?:Q\.?\s*)?\d{1,3}[.)]\s*", "", raw[first][0])
+        return _clean_title("Frequently Asked Questions: " + topic)
+
+    for t in texts[:6]:                                                # 5
+        letters = [c for c in t if c.isalpha()]
+        if (len(t.split()) >= 3 and letters and sum(c.isupper() for c in letters) / len(letters) > 0.8
+                and not LETTERHEAD.match(t)):
+            return _clean_title(t)
     return ""
 
 
@@ -2109,7 +2264,8 @@ def title_from_file_name(path: Path) -> str:
 
 def choose_title(parsed, sections, pdf_path: Path, watermarks):
     """First GOOD candidate: subject line, title found by the parser, headings, file name."""
-    candidates = [m.group(1) for m in SUBJECT_TITLE.finditer(parsed.get("original_head", ""))][:1]
+    candidates = [official_title(pdf_path)]                     # 2.3: RBI's own title on page 1
+    candidates += [m.group(1) for m in SUBJECT_TITLE.finditer(parsed.get("original_head", ""))][:1]
     candidates.append(parsed.get("title", ""))
     candidates += [s["text"].lstrip("# ").strip() for s in sections if s["type"] == "heading"][:15]
     for c in candidates:
@@ -2342,6 +2498,17 @@ def main():
             cleaned_text = to_markdown(parsed)
             head = parsed.pop("original_head", "")      # first page before element 27
             parsed["metadata"] = extract_version_metadata(head + "\n" + cleaned_text)
+            # 2.4: some PDFs lose page 1 in parsing (a table-of-contents page, a cover). Fill the
+            # fields that are still empty from the RAW first page (circular no., dates).
+            meta = parsed["metadata"]
+            if not (meta.get("issue_date") and meta.get("updated_on") and
+                    (meta.get("circular_no") or meta.get("doc_type") != "rbi_circular")):
+                raw_meta = extract_version_metadata(raw_cover_text(pdf, pages=1))
+                for field in ("issue_date", "issue_date_raw", "updated_on", "circular_no"):
+                    if not meta.get(field) and raw_meta.get(field):
+                        if field == "circular_no" and meta.get("doc_type") != "rbi_circular":
+                            continue
+                        meta[field] = raw_meta[field]
             # The cover page (often only "Annual Report 2025-26" in big letters) can be removed
             # by the cleaning above, so also check the RAW first 3 pages and the PDF's own title.
             if parsed["metadata"].get("doc_type") != "annual_report" and is_annual_report_pdf(pdf):

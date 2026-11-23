@@ -1,9 +1,11 @@
 vector_db/
 output/
+raw_pdfs/
+*.pdf
 .venv/
-.venv-ragas/
 __pycache__/
-*.complete.json
-.env
-rename_map.csv
+.pytest_cache/
 .vscode/
+*.complete.json
+rename_map.csv
+raw_pdfs/

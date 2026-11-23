@@ -1,5 +1,3 @@
-ragas
-datasets
 pdfplumber
 pymupdf
 langchain-core

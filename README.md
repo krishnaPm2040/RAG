@@ -65,7 +65,7 @@ Tested with **Python 3.12** on Windows 11.
    .venv\Scripts\activate          (Windows)   |   source .venv/bin/activate   (Linux/Mac)
    python -m pip install -r requirements.txt
    ```
-3. Put the PDFs in `raw_pdfs/` (they are not in the repository).
+3. Put the PDFs in `raw_pdfs/`.
 4. OCR (optional, for scanned pages): see [OCR setup](#ocr-setup-scanned-pages).
 
 > On a company PC where Device Guard blocks `.exe` files inside `.venv`, start every tool through

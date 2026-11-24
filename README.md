@@ -154,14 +154,23 @@ python eval.py --report                                        # eval_report.md 
 Scored at k = 5. Model: `qwen3:8b` on a laptop CPU, about 35 seconds per answer.
 
 <!-- RESULTS:START -->
-| Test set | Setup | Hit@1 | Hit@3 | Hit@5 | MRR@5 | Key facts | No-answer refused |
-|---|---|---|---|---|---|---|---|
-| qa_test_set.csv | `bm25-pages` | 0.575 | 0.775 | 0.800 | 0.676 |  |  |
-| qa_test_set.csv | `recursive` | 0.725 | 0.850 | 0.875 | 0.784 | 0.685 | 0.900 |
-| qa_test_set.csv | `recursive+hybrid` | 0.750 | 0.875 | 0.900 | 0.810 | 0.749 | 1.000 |
-| qa_heldout.csv | `bm25-pages` | 0.438 | 0.688 | 0.750 | 0.568 |  |  |
-| qa_heldout.csv | `recursive` | 0.562 | 0.812 | 0.812 | 0.677 |  |  |
-| qa_heldout.csv | `recursive+hybrid` | 0.562 | 0.750 | 0.750 | 0.656 | 0.762 | 1.000 |
+_Filled by `python eval.py --report` on 2026-11-24 21:22._
+
+| Test set | Setup | Hit@1 | Hit@3 | Hit@5 | MRR@5 | Key facts | No-answer refused | Faithfulness | Answer relevance |
+|---|---|---|---|---|---|---|---|---|---|
+| qa_test_set.csv | `bm25-pages` | 0.025 | 0.025 | 0.025 | 0.025 |  |  |  |  |
+| qa_test_set.csv | `fixed` | 0.650 | 0.800 | 0.875 | 0.729 | 0.670 | 1.000 |  |  |
+| qa_test_set.csv | `fixed+hybrid` | 0.700 | 0.850 | 0.925 | 0.777 | 0.769 | 1.000 |  |  |
+| qa_test_set.csv | `fixed+hybrid+rerank` | 0.800 | 0.900 | 0.900 | 0.850 | 0.701 | 0.900 |  |  |
+| qa_test_set.csv | `fixed+hybrid+rerank+rewrite` | 0.800 | 0.900 | 0.900 | 0.850 | 0.738 | 0.800 |  |  |
+| qa_test_set.csv | `recursive` | 0.725 | 0.850 | 0.875 | 0.784 | 0.685 | 0.900 |  |  |
+| qa_test_set.csv | `recursive+hybrid` | 0.750 | 0.875 | 0.900 | 0.810 | 0.749 | 1.000 |  |  |
+| qa_test_set.csv | `recursive+hybrid+rerank` | 0.775 | 0.925 | 0.925 | 0.842 | 0.733 | 0.900 |  |  |
+| qa_test_set.csv | `recursive+hybrid+rerank+rewrite` | 0.800 | 0.925 | 0.925 | 0.854 | 0.772 | 0.900 |  |  |
+| qa_heldout.csv | `bm25-pages` | 0.062 | 0.062 | 0.062 | 0.062 |  |  |  |  |
+| qa_heldout.csv | `recursive` (retrieval only) | 0.562 | 0.812 | 0.812 | 0.677 |  |  |  |  |
+| qa_heldout.csv | `recursive+hybrid` (retrieval only) | 0.562 | 0.750 | 0.750 | 0.656 |  |  |  |  |
+| qa_heldout.csv | `recursive+hybrid` | 0.562 | 0.750 | 0.750 | 0.656 | 0.762 | 1.000 |  |  |
 <!-- RESULTS:END -->
 
 Full table with per-question wins and losses: [eval_report.md](eval_report.md).

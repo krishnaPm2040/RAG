@@ -43,7 +43,7 @@ flowchart LR
 | `app.py` | JSON -> chunks -> vector databases in `vector_db/`; retrieval and answers |
 | `streamlit_app.py` | Chat UI (only opens the databases, never builds them) |
 | `eval.py` | Retrieval and answer evaluation, baseline, report |
-| `check_corpus.py` | Chunks per file / type, short chunks, long headings, wrong titles |
+| `check_copus.py` | Chunks per file / type, short chunks, long headings, wrong titles |
 | `qa_test_set.csv` | Main test set: 40 answerable + 10 out-of-scope questions |
 | `qa_heldout.csv` | Held-out test set: 16 answerable + 4 out-of-scope questions, never used for tuning |
 | `tests/test_logic.py` | 39 fast tests of the logic (no Ollama needed) |
@@ -76,7 +76,7 @@ Tested with **Python 3.12** on Windows 11.
 ```
 python clean_pdfs.py                          # 1. PDF -> clean JSON (only new / changed PDFs)
 python app.py                                 # 2. build all 3 databases (semantic is slow: do not stop it)
-python check_corpus.py                        # 3. check the corpus (files, types, short chunks, titles)
+python check_copus.py                        # 3. check the corpus (files, types, short chunks, titles)
 python -m streamlit run streamlit_app.py      # 4. chat at http://localhost:8501
 python -m pytest tests -q                     #    logic tests (no Ollama needed)
 ```

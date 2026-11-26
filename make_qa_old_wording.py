@@ -1,0 +1,33 @@
+"""Creates qa_old_wording.csv (review N4): the six withdrawn-circular questions (q033-q038)
+in the plain words of a real user, without "withdrawn"."""
+import csv
+
+NOTE = ("review N4: plain wording of {} (no 'withdrawn'). Only a WITHDRAWN document answers it: "
+        "the bot should fall back to it and say it is an old version.")
+
+rows = [
+    ["o01", "How much is a customer liable for if an unauthorised electronic banking transaction is reported on the 5th working day?",
+     "Within 4 to 7 working days: the transaction value or the amount in Table 1, whichever is lower. (Within 3 working days = zero liability; beyond 7 days = as per the bank's Board approved policy.)",
+     "a669bd4f2271", "RBI (Customer Protection) Direction.pdf", "5", "table", NOTE.format("q033")],
+    ["o02", "Within how many working days must a bank credit back (shadow reversal) the amount of an unauthorised electronic transaction?",
+     "Within 10 working days from the date the customer notifies the bank.",
+     "a669bd4f2271", "RBI (Customer Protection) Direction.pdf", "5", "paragraph", NOTE.format("q034")],
+    ["o03", "What is the maximum exposure of an urban co-operative bank to a single borrower and to a group of connected borrowers?",
+     "Individual borrower: 15 per cent of Tier-I capital; group of connected borrowers/parties: 25 per cent of Tier-I capital.",
+     "c63362dac0c2", "RBI (Master Circular 2025) Direction.pdf", "5", "list", NOTE.format("q035")],
+    ["o04", "Can a bank offer NRE or NRO term deposits without a premature withdrawal option?",
+     "Yes, but NRE / NRO term deposits from individuals (singly or jointly) of Rs one crore and below must have the premature withdrawal facility.",
+     "b0c45f2aab12", "RBI DBR 2015-16 19.pdf", "12", "paragraph", NOTE.format("q036")],
+    ["o05", "Until when can a bank keep allowing all transactions for a low-risk individual customer whose KYC update is overdue?",
+     "The RE must allow all transactions and get the KYC updated within one year of it falling due or up to June 30, 2026, whichever is later, and monitor such accounts regularly.",
+     "feccb870209a", "Reserve Bank of India (Know Your Customer (KYC)) (Amendment).pdf", "2", "paragraph", NOTE.format("q037")],
+    ["o06", "How many reminders must a regulated entity send a customer before the due date for periodic KYC updation?",
+     "At least three advance intimations before the due date.",
+     "feccb870209a", "Reserve Bank of India (Know Your Customer (KYC)) (Amendment).pdf", "2", "paragraph", NOTE.format("q038")],
+]
+
+with open("qa_old_wording.csv", "w", newline="", encoding="utf-8") as f:
+    w = csv.writer(f, delimiter="\t")
+    w.writerow(["id", "question", "expected_answer", "source_doc_id", "file_name", "page", "answer_type", "notes"])
+    w.writerows(rows)
+print("Saved: qa_old_wording.csv (6 questions)")

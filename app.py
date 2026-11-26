@@ -1015,16 +1015,37 @@ def is_refusal(answer):
     return bool(REFUSAL.search(answer or ""))
 
 
+# Review H2 / N3: the model sometimes opens with "X is not explicitly mentioned in the provided
+# documents. However, ..." and then answers from a passage about something else (q046 GST, q047).
+# Prompt rule 11 says to reply exactly NOT_FOUND_ANSWER then; this enforces it. Only the FIRST
+# sentence is checked, so a full answer that notes one missing detail at the end is kept.
+HEDGE = re.compile(
+    r"\b(?:is|are|was|were)\s+not\s+(?:explicitly\s+|specifically\s+|directly\s+|clearly\s+)?"
+    r"(?:mentioned|stated|specified|provided|given|available|found|addressed|covered)\s+"
+    r"in\s+the\s+(?:provided\s+|given\s+|available\s+)?(?:documents?|passages?|context|sources?)"
+    r"|\b(?:the\s+)?(?:provided\s+)?(?:documents?|passages?|context)\s+(?:do|does)\s+not\s+"
+    r"(?:explicitly\s+|specifically\s+|directly\s+)?(?:contain|mention|specify|state|provide|say)", re.I)
+
+
+def enforce_refusal(answer):
+    """A hedged non-answer ("... not explicitly mentioned in the documents. However ...") becomes the
+    exact refusal, so the user sees no wrong answer and no sources."""
+    first = re.split(r"(?<=[.!?])\s+", (answer or "").strip(), maxsplit=1)[0]
+    if answer and not is_refusal(answer) and HEDGE.search(first):
+        return NOT_FOUND_ANSWER
+    return answer
+
+
 def answer_with_fallback(vector_db, question, results, on_token=None, **search):
     """Answer from `results`. Review N4: if that is a refusal and the question did not ask for old
     versions, search once more WITH withdrawn / superseded documents. Only an answer that really
     uses an old document is kept (its passage header says OLD VERSION, so the answer says so).
     -> (answer, results used, fallback used?)"""
-    answer = generate_answer(question, results, on_token) if results else NOT_FOUND_ANSWER
+    answer = enforce_refusal(generate_answer(question, results, on_token)) if results else NOT_FOUND_ANSWER
     if OLD_FALLBACK and is_refusal(answer) and not OLD_VERSION_HINT.search(question):
         old = retrieve(vector_db, question, include_old=True, **search)
         if any(d.metadata.get("is_latest") is False for d in old):
-            again = generate_answer(question, old, on_token)
+            again = enforce_refusal(generate_answer(question, old, on_token))
             if not is_refusal(again):
                 return again, old, True
     return answer, results, False

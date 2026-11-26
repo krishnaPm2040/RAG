@@ -52,11 +52,12 @@ flowchart LR
 | `check_corpus.py` | Chunks per file / type, short chunks, long headings, wrong titles; writes `corpus_report.md` (title, type, circular no., dates, old/current of every document) |
 | `qa_test_set.csv` | Main test set: 40 answerable + 10 out-of-scope questions |
 | `qa_heldout.csv` | Held-out test set: 16 answerable + 4 out-of-scope questions, never used for tuning |
+| `qa_refusal_check.csv` | Quick check (about 15 minutes): the 14 out-of-scope questions of both sets + 7 answerable ones, to see that the bot refuses what it should and nothing else |
 | `qa_old_wording.csv` | The 6 withdrawn-circular questions in plain wording (no "withdrawn"), for the old-version fallback |
 | `check_lost_docs.py` | For every PDF: skipped? JSON? type, old/current, words, chunks in the database; writes `lost_docs_report.txt` |
-| `tests/test_logic.py` | 49 fast tests of the logic (no Ollama needed) |
+| `tests/test_logic.py` | 52 fast tests of the logic (no Ollama needed) |
 | `eval_report.md` | The evaluation report (made by `python eval.py --report`) |
-| `test_result/` | Every result CSV: `eval_results.csv` (one row per run), `eval_details_*.csv` (every question), `manual_grades_*.csv` (hand grades) |
+| `test_result/` | Every result CSV (latest): `eval_results.csv` (one row per run), `eval_details_*.csv` (every question), `manual_grades_*.csv` (hand grades). `test_result/old/<date_time>/` keeps the earlier version of every file that a new run replaced |
 | `requirements.txt` | Python libraries |
 | `requirements-ragas.txt` | Extra libraries for the RAGAS evaluation (separate venv) |
 
@@ -230,8 +231,6 @@ are saved in `eval_results.csv`, per question in `eval_details_*.csv`, and shown
 
 Scored at k = 5. Model: `qwen3:8b` on a laptop CPU, about 35 seconds per answer.
 
-<!-- RESULTS:START -->
-_Filled by `python eval.py --report` on 2026-11-26 13:36._
 
 | Test set | Setup | Hit@1 | Hit@3 | Hit@5 | MRR@5 | Key facts | No-answer refused | Answered a miss | Faithfulness | Answer relevance |
 |---|---|---|---|---|---|---|---|---|---|---|

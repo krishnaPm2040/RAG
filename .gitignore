@@ -9,3 +9,5 @@ __pycache__/
 *.complete.json
 rename_map.csv
 raw_pdfs/
+.pytest_cache/
+.gitignore

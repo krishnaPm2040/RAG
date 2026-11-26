@@ -310,3 +310,71 @@ def test_results_file_gets_new_columns_without_losing_rows(tmp_path, monkeypatch
     rows = list(_csv.DictReader(path.open(encoding="utf-8-sig")))
     assert [r["setup"] for r in rows] == ["recursive", "recursive+hybrid"]
     assert rows[0]["hit@1"] == "0.725" and rows[1]["answered_on_miss"] == "0/0"
+
+
+def test_resume_finds_only_a_finished_run_with_the_same_settings(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(ev, "RESULTS_FILE", tmp_path / "eval_results.csv")
+    monkeypatch.setattr(ev, "TEST_FILE", tmp_path / "t.csv")
+    (tmp_path / "t.csv").write_text("id\tquestion\nq1\tWhat?\n", encoding="utf-8")
+    settings = ev.run_settings({"strategy": "recursive", "hybrid": True, "rerank": False, "rewrite": False,
+                                "synonyms": False, "stemming": True, "doc_focus": True}, chunks=10)
+    s = {"answerable": 1, "no_answer": 0, "hit@1": 1.0, "sec_per_q": 1.0}
+    assert ev.finished_run("recursive+hybrid", settings) is None          # nothing saved yet
+    ev.save_summary("recursive+hybrid", s, settings)
+    assert ev.finished_run("recursive+hybrid", settings) is None          # no details file: not finished
+    ev.details_path("recursive+hybrid").parent.mkdir(exist_ok=True)
+    ev.details_path("recursive+hybrid").write_text("id\n", encoding="utf-8")
+    assert ev.finished_run("recursive+hybrid", settings)["setup"] == "recursive+hybrid"
+    assert ev.finished_run("recursive+hybrid", dict(settings, chunks_in_db=11)) is None   # new database
+
+
+def test_result_files_go_into_the_test_result_folder(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "eval_results.csv").write_text("time,setup\n", encoding="utf-8")
+    (tmp_path / "eval_details_qa_test_set_recursive.csv").write_text("id\n", encoding="utf-8")
+    ev.move_old_results()
+    assert (tmp_path / "test_result" / "eval_results.csv").exists()
+    assert (tmp_path / "test_result" / "eval_details_qa_test_set_recursive.csv").exists()
+    assert not (tmp_path / "eval_results.csv").exists()
+    assert ev.details_path("recursive").parent.name == "test_result"
+    assert ev.grades_path("qa_test_set.csv", "recursive+hybrid").parent.name == "test_result"
+
+
+def test_old_result_files_are_kept_in_the_old_folder(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "test_result").mkdir()
+    (tmp_path / "test_result" / "eval_details_x_recursive.csv").write_text("new")
+    (tmp_path / "eval_details_x_recursive.csv").write_text("stray")      # left in the project folder
+    ev.move_old_results()
+    assert not (tmp_path / "eval_details_x_recursive.csv").exists()     # project folder stays clean
+    assert (tmp_path / "test_result" / "eval_details_x_recursive.csv").read_text() == "new"
+    assert (tmp_path / ev.OLD_DIR / "eval_details_x_recursive.csv").read_text() == "stray"
+    ev.keep_old(tmp_path / "test_result" / "eval_details_x_recursive.csv")  # before a re-run writes it
+    assert (tmp_path / ev.OLD_DIR / "eval_details_x_recursive.csv").read_text() == "new"
+
+
+# ---------------------------------------------------------------------------
+# H2 / N3: a hedged non-answer becomes the exact refusal
+# ---------------------------------------------------------------------------
+
+def test_h2_hedged_non_answers_become_the_refusal():
+    for hedge in [
+        "The GST rate applicable to the processing fee on a bank loan is not explicitly mentioned in the "
+        "provided documents. However, it is stated that fees and charges must be reasonable [1].",
+        "The minimum capital adequacy ratio that a Small Finance Bank must maintain is not explicitly stated "
+        "in the provided documents. However, commercial banks need 9 per cent [2].",
+        "The provided documents do not specify the GST rate. However, banks must disclose charges [1].",
+    ]:
+        assert app.enforce_refusal(hedge) == app.NOT_FOUND_ANSWER
+
+
+def test_h2_real_answers_are_kept():
+    for answer in [
+        "A Small Finance Bank must keep a minimum CRAR of 15 per cent [1].",
+        "The complaint must be filed within one year [1]. The exact form number is not mentioned in the "
+        "documents.",                                    # a missing detail at the END is fine
+        app.NOT_FOUND_ANSWER,
+        "",
+    ]:
+        assert app.enforce_refusal(answer) == answer

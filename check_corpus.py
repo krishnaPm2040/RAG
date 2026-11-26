@@ -3,15 +3,59 @@ check_corpus.py - shows which documents fill your vector database.
 
   python check_corpus.py                      -> recursive database
   python check_corpus.py --strategy=semantic  -> another strategy
+  python check_corpus.py --titles             -> ONLY corpus_report.md (no database needed)
+
+Always writes corpus_report.md: title, type, circular number, dates and old/current of every
+document, so the titles can be checked on GitHub (output/json/ is not committed).
 
 Prints, for every source file: number of chunks and % of all chunks.
 Use it to check that the corpus matches DOMAIN in app.py.
 """
 
+import json
 import sys
 from collections import Counter
+from pathlib import Path
 
 import app
+
+app.apply_cli(sys.argv)
+REPORT = Path("corpus_report.md")
+
+
+def write_titles_report():
+    """corpus_report.md: one row per document, read from output/json (no database needed)."""
+    try:
+        from clean_pdfs import bad_title
+    except Exception:
+        bad_title = lambda t, w=(): ""
+    rows, wrong = [], 0
+    for f in sorted(app.JSON_FOLDER.glob("*.json")):
+        d = json.loads(f.read_text(encoding="utf-8"))
+        m = d.get("metadata", {})
+        title = (d.get("title") or "").replace("|", "/")
+        why = bad_title(title)
+        wrong += bool(why)
+        in_index = "no (annual report)" if m.get("doc_type") == "annual_report" and not app.INCLUDE_ANNUAL_REPORTS else "yes"
+        rows.append(f"| {d['file_name']} | {title} | {m.get('doc_type') or ''} | {m.get('circular_no') or ''} | "
+                    f"{m.get('issue_date') or ''} | {m.get('updated_on') or ''} | "
+                    f"{'current' if m.get('is_latest', True) else 'OLD (' + (m.get('stamp') or 'superseded') + ')'} | "
+                    f"{in_index} | {'**' + why + '**' if why else 'ok'} |")
+    if not rows:
+        sys.exit(f"No JSON in {app.JSON_FOLDER}/. Run clean_pdfs.py first.")
+    text = "\n".join([
+        "# Corpus report", "",
+        f"Made by `python check_corpus.py` from `{app.JSON_FOLDER}/` (written by `clean_pdfs.py`).",
+        f"{len(rows)} documents; titles that look wrong (`bad_title()`): **{wrong}**.", "",
+        "| File | Title | Type | Circular no. | Issue date | Updated on | Version | In index | Title check |",
+        "|---|---|---|---|---|---|---|---|---|", *rows, ""])
+    REPORT.write_text(text, encoding="utf-8")
+    print(f"Saved: {REPORT}  ({len(rows)} documents, {wrong} titles look wrong)")
+
+
+if "--titles" in sys.argv:
+    write_titles_report()
+    sys.exit()
 
 strategy = app.CHUNK_STRATEGY
 if not app.is_built(strategy):
@@ -55,3 +99,5 @@ bad = {s: (t, bad_title(t)) for s, t in titles.items() if bad_title(t)}
 print(f"\nTitles: {len(titles)} files, {len(bad)} look wrong")
 for source, (title, why) in sorted(bad.items()):
     print(f"   {why:<22} {title!r:<40} {source}")
+print()
+write_titles_report()

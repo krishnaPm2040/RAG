@@ -1,6 +1,6 @@
 """
 app.py - the ENGINE of the RAG chatbot: builds and stores the chunks. No chat here.
-The chat is the web UI:  streamlit run streamlit_app.py
+The chat is the web UI:  python -m streamlit run streamlit_app.py
 
   1. python clean_pdfs.py            -> output/json/*.json
   2. ollama pull nomic-embed-text    -> embedding model
@@ -8,7 +8,7 @@ The chat is the web UI:  streamlit run streamlit_app.py
   3. python app.py                   -> builds / checks ALL 3 databases (recursive, fixed, semantic)
      python app.py --strategy=fixed  -> only one strategy
      python app.py --rebuild         -> force a rebuild
-  4. streamlit run streamlit_app.py  -> the chat in your browser
+  4. python -m streamlit run streamlit_app.py  -> the chat in your browser
 
 Everything runs on your PC with Ollama (no API key, no internet needed for answers).
 
@@ -108,8 +108,17 @@ RULES
    a special case, give the general rule first, then the special case as an exception, saying
    who or what it applies to.
 10. Read ALL passages before answering: the general rule may be in a different passage than the
-   one that looks closest to the question."""
+   one that looks closest to the question.
+11. Before answering, check that a passage really answers THIS question: the same subject, the same
+   kind of entity and the same product or scheme. A passage that only shares some words with the
+   question (the same word used for something else, or a rule for a DIFFERENT kind of bank or
+   company) does not answer it. Never apply a rule written for one kind of entity to another kind.
+   If no passage answers the question itself, reply exactly:
+   "I could not find this in the documents.\""""
 
+OLD_FALLBACK = True                             # review N4: when nothing CURRENT answers a question,
+                                                # try once more WITH withdrawn / superseded documents
+                                                # (the answer then says it is an OLD VERSION)
 HISTORY_TURNS = 3                               # earlier Q&A used to understand follow-ups
 
 # Defaults. Streamlit / eval pass their own settings per call; the command line is read only
@@ -493,8 +502,21 @@ def marker_file(strategy=None):
     return Path(DB_FOLDER) / f"{collection_name(strategy)}.complete.json"
 
 
+_fingerprints = {}                                          # review N9: per JSON-folder state
+
+
 def data_fingerprint(strategy=None):
-    """Changes when any JSON file or any chunk setting changes."""
+    """Changes when any JSON file or any chunk setting changes. The (slow) hash of every JSON file
+    is computed again only when a file is added, removed or changed (name, size, time)."""
+    files = sorted(JSON_FOLDER.glob("*.json"))
+    state = (strategy or CHUNK_STRATEGY,
+             tuple((f.name, f.stat().st_size, f.stat().st_mtime_ns) for f in files))
+    if state not in _fingerprints:
+        _fingerprints[state] = _data_fingerprint(strategy, files)
+    return _fingerprints[state]
+
+
+def _data_fingerprint(strategy, files):
     h = hashlib.sha256()
     settings = [strategy or CHUNK_STRATEGY, CHUNK_SIZE, CHUNK_OVERLAP,
                 SEMANTIC_MAX_CHARS, DB_VERSION, EMBED_MODEL, ANNUAL_CHUNK_SIZE,
@@ -502,7 +524,7 @@ def data_fingerprint(strategy=None):
                 MIN_SECTION_CHARS, MAX_HEADING_PATH, SMALL_SECTION_CHARS, MIN_CHUNK_CHARS,
                 SEMANTIC_PERCENTILE, SEMANTIC_OUTLIER, SEMANTIC_MIN_GAP]
     h.update(json.dumps(settings).encode())
-    for f in sorted(JSON_FOLDER.glob("*.json")):
+    for f in files:
         h.update(f.name.encode())
         h.update(f.read_bytes())
     return h.hexdigest()[:16]
@@ -614,10 +636,11 @@ SCOPES = {"all": None,                                     # eval.py --scope= (t
           "annual_reports": {"doc_type": "annual_report"}}
 
 
-def search_filter(question, scope="all"):
-    """Chroma filter: latest versions only (unless the question asks for old ones) + document type."""
+def search_filter(question, scope="all", include_old=False):
+    """Chroma filter: latest versions only (unless the question asks for old ones, or include_old)
+    + document type."""
     parts = []
-    if not OLD_VERSION_HINT.search(question):
+    if not include_old and not OLD_VERSION_HINT.search(question):
         parts.append({"is_latest": True})
     if SCOPES.get(scope):
         parts.append(SCOPES[scope])
@@ -827,15 +850,38 @@ def rrf_merge(result_lists, c=60):
 
 
 # 4f. Re-ranker
+# A cross-encoder run with plain `transformers` (no sentence-transformers). Newer
+# sentence-transformers versions import `datasets` -> `pyarrow`, whose DLLs are blocked by
+# Windows Application Control (Device Guard) on company PCs. Same model, same scores.
+RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 _reranker = None
+
+
+class CrossEncoder:
+    def __init__(self, name):
+        import torch
+        from transformers import AutoModelForSequenceClassification, AutoTokenizer
+        self.torch = torch
+        self.tokenizer = AutoTokenizer.from_pretrained(name)
+        self.model = AutoModelForSequenceClassification.from_pretrained(name).eval()
+
+    def predict(self, pairs, batch_size=16):
+        """[(question, passage), ...] -> one relevance score per pair (higher = better)."""
+        scores = []
+        for i in range(0, len(pairs), batch_size):
+            batch = pairs[i:i + batch_size]
+            enc = self.tokenizer([q for q, _ in batch], [d for _, d in batch], padding=True,
+                                 truncation=True, max_length=512, return_tensors="pt")
+            with self.torch.no_grad():
+                scores += self.model(**enc).logits[:, 0].tolist()
+        return scores
 
 
 def get_reranker():
     global _reranker
     if _reranker is None:                                  # downloads once (~90 MB)
-        from sentence_transformers import CrossEncoder
         print("Loading re-ranker...")
-        _reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+        _reranker = CrossEncoder(RERANK_MODEL)
     return _reranker
 
 
@@ -850,7 +896,8 @@ def rerank(question, docs):
 #    change each other's settings)
 # ---------------------------------------------------------------------------
 
-def retrieve(vector_db, question, hybrid=None, rerank_on=None, rewrite=None, scope=None, top_k=None):
+def retrieve(vector_db, question, hybrid=None, rerank_on=None, rewrite=None, scope=None, top_k=None,
+             include_old=False):
     scope = scope or SEARCH_SCOPE
     hybrid = USE_HYBRID if hybrid is None else hybrid
     rerank_on = USE_RERANK if rerank_on is None else rerank_on
@@ -861,7 +908,7 @@ def retrieve(vector_db, question, hybrid=None, rerank_on=None, rewrite=None, sco
     if rewrite:
         print(f"  (searching for: {query})")
 
-    where = search_filter(question, scope)
+    where = search_filter(question, scope, include_old)
     k = FETCH_K                                            # fetch more, then keep max 3 per file
     # Cut-off (review M6): it uses the vector score, so it is NOT applied when the question
     # names a circular number: an exact number is found by BM25 even when the vector score is low.
@@ -873,7 +920,7 @@ def retrieve(vector_db, question, hybrid=None, rerank_on=None, rewrite=None, sco
     else:
         results = vector_db.similarity_search(query, k=k, filter=where)
 
-    only_latest = not OLD_VERSION_HINT.search(question)
+    only_latest = not (include_old or OLD_VERSION_HINT.search(question))
     if hybrid:
         keyword = get_keyword_index(vector_db).search(query, FETCH_K, scope=scope, only_latest=only_latest)
         results = rrf_merge([results, keyword])[:FETCH_K]
@@ -961,6 +1008,26 @@ def check_citations(answer, n_sources):
 
 
 REFUSAL = re.compile(r"could not find this in the documents", re.I)
+NOT_FOUND_ANSWER = "I could not find this in the documents."
+
+
+def is_refusal(answer):
+    return bool(REFUSAL.search(answer or ""))
+
+
+def answer_with_fallback(vector_db, question, results, on_token=None, **search):
+    """Answer from `results`. Review N4: if that is a refusal and the question did not ask for old
+    versions, search once more WITH withdrawn / superseded documents. Only an answer that really
+    uses an old document is kept (its passage header says OLD VERSION, so the answer says so).
+    -> (answer, results used, fallback used?)"""
+    answer = generate_answer(question, results, on_token) if results else NOT_FOUND_ANSWER
+    if OLD_FALLBACK and is_refusal(answer) and not OLD_VERSION_HINT.search(question):
+        old = retrieve(vector_db, question, include_old=True, **search)
+        if any(d.metadata.get("is_latest") is False for d in old):
+            again = generate_answer(question, old, on_token)
+            if not is_refusal(again):
+                return again, old, True
+    return answer, results, False
 
 
 def sources_to_show(answer, results):
@@ -984,14 +1051,12 @@ def answer_question(vector_db, question, history=None, hybrid=None, rerank_on=No
                 "answer": f"Hello! Ask me a question about {DOMAIN}, for example: "
                           "'What is the Rs 2000 note exchange limit?'"}
     standalone = make_standalone(question, history)
-    results = retrieve(vector_db, standalone, hybrid, rerank_on, rewrite, scope)
-    if not results:
-        answer = "I could not find this in the documents."
-    else:
-        answer = generate_answer(standalone, results, on_token)
+    search = dict(hybrid=hybrid, rerank_on=rerank_on, rewrite=rewrite, scope=scope)
+    results = retrieve(vector_db, standalone, **search)
+    answer, results, used_old = answer_with_fallback(vector_db, standalone, results, on_token, **search)
     cited, invalid = check_citations(answer, len(results))
     return {"question_used": standalone, "results": results, "answer": answer,
-            "cited": cited, "invalid_citations": invalid}
+            "cited": cited, "invalid_citations": invalid, "used_old_versions": used_old}
 
 
 # ---------------------------------------------------------------------------
@@ -1006,4 +1071,4 @@ if __name__ == "__main__":
         print(f"\n=== {name} ===")
         db = get_vector_db(rebuild="--rebuild" in sys.argv, strategy=name)
         print(f"Ready: {db._collection.count()} chunks in '{collection_name(name)}'.")
-    print("\nAll done. Start the chat:  streamlit run streamlit_app.py")
+    print("\nAll done. Start the chat:  python -m streamlit run streamlit_app.py")

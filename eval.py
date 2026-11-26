@@ -27,12 +27,19 @@ Options for any line:
   --retrieval-only        no answers: fast, scores only retrieval
   --ragas                 also faithfulness + answer relevance (separate venv, see README)
   --ids                   print the doc_id of every file in the database
+  --resume                skip a run that already FINISHED with the same settings (same setup,
+                          test file, database, retrieval-only / answers): after a stop, start the
+                          same commands again with --resume and they go on where they stopped
+  --grade                 hand-grade the answers that have no numbers (review N6), e.g.
+                          python eval.py --grade --strategy=recursive --hybrid
 
 Fair comparison: every setup is scored at the SAME k (Hit@1, Hit@3, Hit@k, MRR@k). The
 chatbot itself answers from app.TOP_K = 5 passages.
 
-Every run adds one row to eval_results.csv (with all its settings) and writes
-eval_details_<test file>_<setup>.csv (every question: hit, rank, answer, key facts, seconds).
+Every result CSV is in test_result/: each run adds one row to test_result/eval_results.csv (with
+all its settings) and writes test_result/eval_details_<test file>_<setup>.csv (every question: hit,
+rank, answer, key facts, seconds). The earlier version of a file that is written again is moved to
+test_result/old/<date_time>/, so test_result/ holds the latest results and nothing is lost.
 """
 
 import csv
@@ -52,7 +59,9 @@ EVAL_K = next((int(a.split("=", 1)[1]) for a in sys.argv if a.startswith("--k=")
 TEST_FILE = Path(next((a.split("=", 1)[1] for a in sys.argv if a.startswith("--test=")),
                       "qa_test_set.csv"))
 RETRIEVAL_ONLY = "--retrieval-only" in sys.argv
-RESULTS_FILE = Path("eval_results.csv")
+RESULT_DIR = Path("test_result")                 # every result CSV goes into this folder
+RESULTS_FILE = RESULT_DIR / "eval_results.csv"
+OLD_DIR = RESULT_DIR / "old" / datetime.now().strftime("%Y-%m-%d_%H%M")   # earlier versions, per run
 REPORT_FILE = Path("eval_report.md")
 README = Path("README.md")
 
@@ -160,6 +169,12 @@ def is_hit(meta, case):
 
 
 NUMBER = re.compile(r"\d[\d,]*(?:\.\d+)?")
+NUMBER_WORDS = {w: str(n) for n, w in enumerate(
+    "zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen "
+    "sixteen seventeen eighteen nineteen twenty".split())}
+NUMBER_WORDS.update({"thirty": "30", "forty": "40", "fifty": "50", "sixty": "60", "seventy": "70",
+                     "eighty": "80", "ninety": "90", "hundred": "100", "half-yearly": "6", "twice": "2"})
+NUMBER_WORD = re.compile(r"\b(" + "|".join(map(re.escape, NUMBER_WORDS)) + r")\b", re.I)
 EMAIL_OR_URL = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+|https?://\S+", re.I)
 
 
@@ -172,6 +187,7 @@ def key_facts(text):
         n = n.replace(",", "").rstrip(".")
         if n:
             facts.add(n)
+    facts |= {NUMBER_WORDS[w.lower()] for w in NUMBER_WORD.findall(clean)}   # "three" = "3" (N6)
     return facts
 
 
@@ -213,8 +229,15 @@ def label_of(s):
     return "+".join(parts).replace("+-", "-")
 
 
+def test_md5(path):
+    """Fingerprint of the test file's TEXT: Windows (CRLF) and Linux (LF) line endings give the same
+    md5, so a git checkout does not look like a new version of the test set (review N1)."""
+    path = Path(path)
+    return hashlib.md5(path.read_bytes().replace(b"\r\n", b"\n")).hexdigest()[:8] if path.exists() else ""
+
+
 def run_settings(s, vector_db=None, chunks=""):
-    md5 = hashlib.md5(TEST_FILE.read_bytes()).hexdigest()[:8] if TEST_FILE.exists() else ""
+    md5 = test_md5(TEST_FILE)
     order = ("strategy", "hybrid", "rerank", "rewrite", "synonyms", "stemming", "doc_focus")
     return {**{k: s[k] for k in order}, "scope": app.SEARCH_SCOPE, "eval_k": EVAL_K, "answer_k": app.TOP_K,
             "retrieval_only": RETRIEVAL_ONLY,
@@ -238,13 +261,16 @@ def run_questions(vector_db, cases):
         docs = app.retrieve(vector_db, case["question"], top_k=EVAL_K)     # scored at the SAME k
         t1 = time.perf_counter()
         used = docs[:app.TOP_K]                                            # what the bot answers from
+        old_used = False
         if RETRIEVAL_ONLY:
             answer = ""
-        else:
-            answer = (app.generate_answer(case["question"], used) if used
-                      else "I could not find this in the documents.")
+        else:                                  # the same path as the chatbot, incl. the N4 fallback
+            answer, used, old_used = app.answer_with_fallback(vector_db, case["question"], used,
+                                                              top_k=app.TOP_K)
         t2 = time.perf_counter()
-        row = {"case": case, "docs": docs, "used": used, "answer": answer,
+        if old_used:                           # N4: the bot answered from the second (old-version)
+            docs = used                        # search, so that is what is scored
+        row = {"case": case, "docs": docs, "used": used, "answer": answer, "old_fallback": old_used,
                "sec_retrieval": t1 - t0, "sec_answer": t2 - t1}
         try:
             row["score"] = app.top_relevance(vector_db, case["question"])  # for the cut-off advice
@@ -260,6 +286,10 @@ def run_questions(vector_db, cases):
             row["doc_rank"] = next((i for i, d in enumerate(docs, start=1) if same_doc(d.metadata, case)), None)
             row["facts"] = fact_score(case["answer"], answer) if not RETRIEVAL_ONLY else (0, 0)
             status = (f"HIT @{row['rank']}" if row["rank"] else "DOC ONLY" if row["doc_rank"] else "MISS")
+            if not RETRIEVAL_ONLY and not row["rank"] and not row["doc_rank"] and not app.is_refusal(answer):
+                status += " but ANSWERED"      # review N3: a fluent answer from the wrong passages
+        if old_used:
+            status += " (old version)"
         print(f"  [{n}/{len(cases)}] {case['id']:<5} {case['type']:<13} {status:<18} "
               f"{row['sec_retrieval'] + row['sec_answer']:5.1f}s  {case['question'][:50]}")
         details.append(row)
@@ -305,6 +335,11 @@ def score(details):
                         for t in sorted({d["case"]["type"] for d in answerable})}
     if no_answer and not RETRIEVAL_ONLY:
         s["no_answer_acc"] = sum(1 for d in no_answer if d["refused"]) / len(no_answer)
+    if answerable and not RETRIEVAL_ONLY:
+        missed = [d for d in answerable if not d["rank"] and not d["doc_rank"]]
+        answered = [d for d in missed if not app.is_refusal(d["answer"])]
+        s["answered_on_miss"] = f"{len(answered)}/{len(missed)}"     # review N3
+        s["old_fallback"] = sum(1 for d in details if d.get("old_fallback"))  # review N4
     s["sec_per_q"] = sum(d["sec_retrieval"] + d["sec_answer"] for d in details) / max(len(details), 1)
     return s
 
@@ -341,16 +376,27 @@ def details_path(label, test_file=None, retrieval_only=None):
     stem = Path(test_file or TEST_FILE).stem
     ro = RETRIEVAL_ONLY if retrieval_only is None else retrieval_only
     suffix = "_retrieval-only" if ro and label != "bm25-pages" else ""
-    return Path(f"eval_details_{stem}_{label.replace('+', '_')}{suffix}.csv")
+    return RESULT_DIR / f"eval_details_{stem}_{label.replace('+', '_')}{suffix}.csv"
 
 
 DETAIL_COLUMNS = ["id", "type", "question", "expected_file", "expected_pages", "result", "rank",
                   "retrieved (file p.page)", "bot_answer", "expected_answer", "key_facts",
-                  "seconds", "faithfulness", "answer_relevance", "top_relevance_score"]
+                  "seconds", "faithfulness", "answer_relevance", "top_relevance_score", "old_version_used"]
+
+
+def keep_old(path):
+    """Before a result file is written again, move the earlier version to test_result/old/<date_time>/:
+    test_result/ always holds the LATEST results, and nothing is lost."""
+    path = Path(path)
+    if path.exists():
+        OLD_DIR.mkdir(parents=True, exist_ok=True)
+        path.replace(OLD_DIR / path.name)
 
 
 def save_details(label, details, ragas_df=None):
     path = details_path(label)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    keep_old(path)
     ragas_rows = iter(ragas_df.to_dict("records")) if ragas_df is not None else None
     with path.open("w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
@@ -374,25 +420,32 @@ def save_details(label, details, ragas_df=None):
                         ", ".join(map(str, sorted(c["pages"]))), result, rank, got,
                         d["answer"], c["answer"], facts,
                         f"{d['sec_retrieval'] + d['sec_answer']:.1f}", faith, rel,
-                        f"{d['score']:.3f}" if d.get("score") is not None else ""])
+                        f"{d['score']:.3f}" if d.get("score") is not None else "",
+                        "yes" if d.get("old_fallback") else ""])
     return path
 
 
 SUMMARY_COLUMNS = ["time", "setup", "questions", "hit@1", "hit@3", "hit@k", "mrr@k", "doc_hit@k",
                    "answer_correct", "no_answer_acc", "sec_per_q", "faithfulness", "answer_relevance",
-                   "ragas_judge"]
+                   "ragas_judge", "answered_on_miss", "old_fallback", "cutoff_advice"]
 
 
-def save_summary(label, s, settings, faithfulness="", relevance=""):
+def save_summary(label, s, settings, faithfulness="", relevance="", advice=""):
     """One row per run, WITH its settings, so runs can be told apart later."""
     header = SUMMARY_COLUMNS + list(settings)
+    RESULTS_FILE.parent.mkdir(parents=True, exist_ok=True)
     if RESULTS_FILE.exists():
         with RESULTS_FILE.open(encoding="utf-8-sig") as f:
+            old_rows = list(csv.DictReader(f))
+            f.seek(0)
             old_header = next(csv.reader(f), [])
-        if set(old_header) != set(header):             # other columns: keep it aside, start a new file
-            old = RESULTS_FILE.with_name(f"eval_results_old_{datetime.now():%Y%m%d_%H%M%S}.csv")
-            RESULTS_FILE.rename(old)
-            print(f"(old eval_results.csv had other columns: kept as {old.name})")
+        if not set(header) <= set(old_header):         # new columns: add them, KEEP every old row
+            header = old_header + [c for c in header if c not in old_header]
+            with RESULTS_FILE.open("w", newline="", encoding="utf-8-sig") as f:
+                w = csv.DictWriter(f, fieldnames=header, restval="")
+                w.writeheader()
+                w.writerows(old_rows)
+            print("(eval_results.csv: new columns added, old rows kept)")
         else:
             header = old_header                        # same columns: keep the file's order
     new_file = not RESULTS_FILE.exists()
@@ -404,9 +457,11 @@ def save_summary(label, s, settings, faithfulness="", relevance=""):
            "doc_hit@k": fmt(s.get("doc_hit_rate", "")), "answer_correct": fmt(s.get("answer_correct", "")),
            "no_answer_acc": fmt(s.get("no_answer_acc", "")), "sec_per_q": f"{s['sec_per_q']:.1f}",
            "faithfulness": fmt(faithfulness), "answer_relevance": fmt(relevance),
-           "ragas_judge": settings["chat_model"] if faithfulness != "" else "", **settings}
+           "ragas_judge": settings["chat_model"] if faithfulness != "" else "",
+           "answered_on_miss": s.get("answered_on_miss", ""), "old_fallback": s.get("old_fallback", ""),
+           "cutoff_advice": " ".join((advice or "").split()), **settings}
     with RESULTS_FILE.open("a", newline="", encoding="utf-8-sig") as f:
-        w = csv.DictWriter(f, fieldnames=header)
+        w = csv.DictWriter(f, fieldnames=header, restval="")
         if new_file:
             w.writeheader()
         w.writerow(row)
@@ -427,6 +482,9 @@ def print_scores(label, s, settings, faithfulness=""):
             print(f"     {t:<20}: {hits}/{total}")
     if "no_answer_acc" in s:
         print(f"  No-answer refused      : {s['no_answer_acc']:.3f}   ({s['no_answer']} questions)")
+    if "answered_on_miss" in s:
+        print(f"  Answered a miss        : {s['answered_on_miss']}   (wrong passages, answered anyway)")
+        print(f"  Old-version fallback   : {s['old_fallback']} questions")
     print(f"  Seconds per question   : {s['sec_per_q']:.1f}")
     if faithfulness != "":
         print(f"  (RAGAS graded by {settings['chat_model']}, the same model: treat as rough)")
@@ -436,6 +494,30 @@ def print_scores(label, s, settings, faithfulness=""):
 # 7. Runs
 # ---------------------------------------------------------------------------
 
+RESUME = "--resume" in sys.argv
+
+
+def finished_run(label, settings):
+    """--resume: the saved row of a run that already finished with exactly these settings, or None.
+    A run counts only when its details file exists too (written at the very end of a run)."""
+    if not RESULTS_FILE.exists() or not details_path(label).exists():
+        return None
+    keys = ("test_file", "test_file_md5", "retrieval_only", "chunks_in_db", "db_version", "eval_k",
+            "chat_model", "embed_model", "min_relevance")
+    with RESULTS_FILE.open(encoding="utf-8-sig") as f:
+        rows = [r for r in csv.DictReader(f) if r.get("setup") == label
+                and all(str(r.get(k, "")) == str(settings[k]) for k in keys)]
+    if "--ragas" in sys.argv:
+        rows = [r for r in rows if r.get("faithfulness")]
+    return rows[-1] if rows else None
+
+
+def scores_from_row(row):
+    num = lambda k: float(row[k]) if row.get(k) else 0.0
+    return {"hit@1": num("hit@1"), "hit@3": num("hit@3"), "hit_rate": num("hit@k"), "mrr": num("mrr@k"),
+            "doc_hit_rate": num("doc_hit@k"), "sec_per_q": num("sec_per_q")}
+
+
 def run_one(cases, setup=None):
     setup = setup or current_setup()
     use_setup(setup)
@@ -443,6 +525,10 @@ def run_one(cases, setup=None):
     print(f"\nSetup: {label}   ({TEST_FILE.name})\n")
     vector_db = app.get_vector_db(strategy=setup["strategy"])
     settings = run_settings(setup, vector_db)
+    done = finished_run(label, settings) if RESUME else None
+    if done:
+        print(f"  --resume: already finished on {done['time']} with the same settings: skipped")
+        return label, scores_from_row(done), details_path(label)
     details = run_questions(vector_db, cases)
     s = score(details)
     faithfulness = relevance = ""
@@ -455,7 +541,7 @@ def run_one(cases, setup=None):
     if advice:
         print(advice)
     print("=" * 60)
-    save_summary(label, s, settings, faithfulness, relevance)
+    save_summary(label, s, settings, faithfulness, relevance, advice)
     path = save_details(label, details, ragas_df)
     print(f"Saved: {RESULTS_FILE} and {path}")
     return label, s, path
@@ -494,7 +580,8 @@ def run_all(cases):
         rows += [[label] + r for r in part[1:]]
     if not runs:
         sys.exit("No database is built. Run: python app.py")
-    all_file = Path(f"eval_details_{TEST_FILE.stem}_all{'_retrieval-only' if RETRIEVAL_ONLY else ''}.csv")
+    all_file = RESULT_DIR / f"eval_details_{TEST_FILE.stem}_all{'_retrieval-only' if RETRIEVAL_ONLY else ''}.csv"
+    keep_old(all_file)
     with all_file.open("w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
         w.writerow(["setup"] + DETAIL_COLUMNS)
@@ -527,6 +614,11 @@ def page_texts():
         doc_ids[data["file_name"]] = (data.get("file_hash") or "")[:12]
         if data.get("metadata", {}).get("doc_type") == "annual_report" and not app.INCLUDE_ANNUAL_REPORTS:
             skip.add(data["file_name"])
+    expected = set(doc_ids) - skip
+    missing = sorted(n for n in expected if not (PDF_FOLDER / n).exists())
+    if missing:                                         # review N1: never publish a floor on a few PDFs
+        sys.exit(f"--bm25-pages: {len(missing)} of {len(expected)} PDFs that clean_pdfs.py indexed are not "
+                 f"in {PDF_FOLDER}/, e.g. {missing[:3]}.\nPut ALL PDFs back in {PDF_FOLDER}/ and run again.")
     pages = {}
     for pdf in sorted(PDF_FOLDER.glob("*.pdf")):
         if pdf.name in skip or pdf.name not in doc_ids:
@@ -536,6 +628,7 @@ def page_texts():
                 pages[(pdf.name, doc_ids[pdf.name], n)] = page.get_text()
     if not pages:
         sys.exit("No PDF pages found: --bm25-pages needs raw_pdfs/ and output/json/ (run clean_pdfs.py).")
+    print(f"BM25 floor: {len(pages)} pages from {len(expected)} PDFs")
     return pages
 
 
@@ -565,6 +658,8 @@ def run_bm25_pages(cases):
     s = score(details)
     s.pop("no_answer_acc", None)
     s.pop("answer_correct", None)
+    s.pop("answered_on_miss", None)
+    s.pop("old_fallback", None)
     label = "bm25-pages"
     settings = run_settings({"strategy": "pages", "hybrid": False, "rerank": False, "rewrite": False,
                              "synonyms": False, "stemming": False, "doc_focus": False},
@@ -593,7 +688,14 @@ def _results_by_test():
     by_test = {}
     for (test, _, _, _), r in latest.items():
         by_test.setdefault(test, []).append(r)
-    return by_test
+    for test, group in by_test.items():                # review N1: never mix two versions of a test
+        now = test_md5(test) or group[-1]["test_file_md5"]     # set in one table
+        old = [r for r in group if r["test_file_md5"] != now]
+        if old:
+            print(f"(report: {len(old)} runs on an OLDER version of {test} are left out: "
+                  f"{', '.join(sorted({r['setup'] for r in old}))}. Run them again.)")
+            by_test[test] = [r for r in group if r["test_file_md5"] == now]
+    return {t: g for t, g in by_test.items() if g}
 
 
 def _baseline(r, group):
@@ -629,7 +731,7 @@ def _wins_losses(r, base):
 def write_report():
     by_test = _results_by_test()
     cols = ("hit@1", "hit@3", "hit@k", "mrr@k", "doc_hit@k", "answer_correct", "no_answer_acc",
-            "faithfulness", "answer_relevance", "sec_per_q")
+            "answered_on_miss", "faithfulness", "answer_relevance", "sec_per_q")
     lines = ["# Evaluation results", "",
              "Every setup is scored at the same k on the same questions. In brackets: change against the",
              "baseline of the same chunking strategy (vectors only, default settings). `bm25-pages` is plain",
@@ -641,15 +743,16 @@ def write_report():
         k = group[0]["eval_k"]
         lines += [f"## {test} (k = {k}, md5 {group[0]['test_file_md5']}, {group[0]['questions']} questions)", "",
                   "| Setup | Hit@1 | Hit@3 | Hit@k | MRR@k | Doc hit@k | Key facts | No-answer refused "
-                  "| Faithfulness | Answer relevance | s/question | Won / lost vs baseline (hit@k) |",
-                  "|---|---|---|---|---|---|---|---|---|---|---|---|"]
+                  "| Answered a miss | Faithfulness | Answer relevance | s/question "
+                  "| Won / lost vs baseline (hit@k) |",
+                  "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
         order = sorted(group, key=lambda r: (r["setup"] != "bm25-pages", r.get("retrieval_only") != "True",
                                              r["strategy"], r["setup"]))
         for r in order:
             b = _baseline(r, group)
             def cell(c):
                 v = r.get(c, "")
-                if not v or b is None or b is r or not b.get(c) or c == "sec_per_q":
+                if not v or b is None or b is r or not b.get(c) or c in ("sec_per_q", "answered_on_miss"):
                     return v
                 return f"{v} ({float(v) - float(b[c]):+.3f})"
             wl = _wins_losses(r, b) if b is not None and b is not r else ""
@@ -658,11 +761,24 @@ def write_report():
             lines.append("| " + " | ".join([name] + [cell(c) for c in cols] + [wl]) + " |")
             readme_rows.append(f"| {test} | {name} | {r.get('hit@1', '')} | {r.get('hit@3', '')} | "
                                f"{r.get('hit@k', '')} | {r.get('mrr@k', '')} | {r.get('answer_correct', '')} | "
-                               f"{r.get('no_answer_acc', '')} | {r.get('faithfulness', '')} | "
-                               f"{r.get('answer_relevance', '')} |")
+                               f"{r.get('no_answer_acc', '')} | {r.get('answered_on_miss', '')} | "
+                               f"{r.get('faithfulness', '')} | {r.get('answer_relevance', '')} |")
         lines.append("")
-    lines += ["Key facts = share of the numbers, amounts, dates and e-mail addresses of the expected answer",
-              "that appear in the bot's answer (review M7). With 40 answerable questions one question is 2.5",
+        notes = []
+        for r in order:                                 # review N8: the cut-off evidence, recorded
+            if r.get("cutoff_advice"):
+                notes.append(f"- Cut-off (`{r['setup']}`): {r['cutoff_advice']}")
+            if r.get("old_fallback") not in (None, "", "0"):
+                notes.append(f"- Old-version fallback (`{r['setup']}`): used for {r['old_fallback']} questions")
+            g = _hand_grades(test, r)                   # review N6
+            if g:
+                notes.append(f"- Hand-graded answers without numbers (`{r['setup']}`): {g}")
+        if notes:
+            lines += notes + [""]
+    lines += ["Key facts = share of the numbers (also written as words), amounts, dates and e-mail addresses",
+              "of the expected answer that appear in the bot's answer (review M7, N6). Answered a miss =",
+              "answerable questions where retrieval missed the right document and the bot answered anyway",
+              "(review N3: should be 0). With 40 answerable questions one question is 2.5",
               "points: read the won / lost columns, not only the averages (review M8).",
               "Faithfulness / answer relevance = RAGAS (python eval.py ... --ragas), graded by the same",
               "local model (qwen3:8b), so treat them as rough.", "",
@@ -683,13 +799,60 @@ def _update_readme(rows):
         print("(README.md has no RESULTS markers: table not updated)")
         return
     table = "\n".join(["| Test set | Setup | Hit@1 | Hit@3 | Hit@5 | MRR@5 | Key facts | No-answer refused "
-                        "| Faithfulness | Answer relevance |",
-                        "|---|---|---|---|---|---|---|---|---|---|"] + rows)
+                        "| Answered a miss | Faithfulness | Answer relevance |",
+                        "|---|---|---|---|---|---|---|---|---|---|---|"] + rows)
     stamp = f"_Filled by `python eval.py --report` on {datetime.now():%Y-%m-%d %H:%M}._"
     before, rest = text.split(start, 1)
     after = rest.split(end, 1)[1]
     README.write_text(f"{before}{start}\n{stamp}\n\n{table}\n{end}{after}", encoding="utf-8")
     print("README.md results table updated.")
+
+
+# ---------------------------------------------------------------------------
+# 10. Hand grading of answers that have no numbers (review N6)
+# ---------------------------------------------------------------------------
+
+def grades_path(test_file, label):
+    return RESULT_DIR / f"manual_grades_{Path(test_file).stem}_{label.replace('+', '_')}.csv"
+
+
+def grade():
+    """Shows every answerable question whose expected answer has no key facts, with the bot's
+    answer, and asks: correct (y) / partly (p) / wrong (n). Saved to manual_grades_*.csv."""
+    label = label_of(current_setup())
+    path = details_path(label, retrieval_only=False)
+    if not path.exists():
+        sys.exit(f"No {path}: run this setup WITH answers first (without --retrieval-only).")
+    with path.open(encoding="utf-8-sig") as f:
+        rows = [r for r in csv.DictReader(f) if r["type"] != "no_answer" and not r["key_facts"]]
+    out, done = grades_path(TEST_FILE, label), {}
+    if out.exists():
+        with out.open(encoding="utf-8-sig") as f:
+            done = {r["id"]: r["grade"] for r in csv.DictReader(f)}
+    print(f"{len(rows)} answers without numbers in {path} ({len(done)} graded before)\n")
+    for r in rows:
+        if r["id"] in done:
+            continue
+        print("=" * 80)
+        print(f"{r['id']}  {r['question']}\n\nEXPECTED: {r['expected_answer']}\n\nBOT:      {r['bot_answer']}\n")
+        g = ""
+        while g not in ("y", "p", "n"):
+            g = input("Correct? y = yes, p = partly, n = no: ").strip().lower()
+        done[r["id"]] = g
+        with out.open("w", newline="", encoding="utf-8-sig") as f:   # saved after every answer
+            w = csv.writer(f)
+            w.writerow(["id", "grade"])
+            w.writerows(sorted(done.items()))
+    print(f"\nSaved: {out}. Run python eval.py --report to show it in the report.")
+
+
+def _hand_grades(test, r):
+    path = grades_path(test, r["setup"])
+    if r.get("retrieval_only") == "True" or not path.exists():
+        return ""
+    with path.open(encoding="utf-8-sig") as f:
+        g = [row["grade"] for row in csv.DictReader(f)]
+    return f"{g.count('y')}/{len(g)} correct, {g.count('p')} partly, {g.count('n')} wrong"
 
 
 def print_doc_ids():
@@ -701,11 +864,31 @@ def print_doc_ids():
         print(f"{doc_id:<14} {source}")
 
 
+def move_old_results():
+    """No result CSV stays next to eval.py: each one moves into test_result/, or, when
+    test_result/ already has a file of that name, into test_result/old/<date_time>/."""
+    RESULT_DIR.mkdir(exist_ok=True)
+    moved = 0
+    for pattern in ("eval_results.csv", "eval_results_old_*.csv", "eval_details_*.csv", "manual_grades_*.csv"):
+        for f in Path(".").glob(pattern):
+            target = RESULT_DIR / f.name
+            if target.exists():
+                OLD_DIR.mkdir(parents=True, exist_ok=True)
+                target = OLD_DIR / f.name
+            f.replace(target)
+            moved += 1
+    if moved:
+        print(f"(moved {moved} result files from the project folder into {RESULT_DIR}/)")
+
+
 if __name__ == "__main__":
+    move_old_results()
     if "--report" in sys.argv:
         write_report()
     elif "--ids" in sys.argv:
         print_doc_ids()
+    elif "--grade" in sys.argv:
+        grade()
     elif "--bm25-pages" in sys.argv:
         run_bm25_pages(load_cases())
     elif "--all" in sys.argv:

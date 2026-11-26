@@ -228,3 +228,85 @@ def test_m3_updated_on_is_found():
 def test_l1_ui_has_no_annual_report_option():
     ui = (ROOT / "streamlit_app.py").read_text(encoding="utf-8")
     assert "Annual reports only" not in ui
+
+
+# ---------------------------------------------------------------------------
+# Final-review resubmission findings (N1, N3, N4, N6, N9)
+# ---------------------------------------------------------------------------
+
+import eval as ev                              # noqa: E402
+
+
+def test_n6_number_words_count_as_key_facts():
+    assert "3" in ev.key_facts("At least three advance intimations before the due date.")
+    assert ev.fact_score("three reminders", "The RE must send 3 reminders [1].") == (1, 1)
+    assert ev.fact_score("three reminders", "The RE must send three reminders [1].") == (1, 1)
+
+
+def test_n4_include_old_drops_the_latest_filter():
+    q = "How much is a customer liable for if a fraud is reported on the 5th working day?"
+    assert app.search_filter(q) == {"is_latest": True}
+    assert app.search_filter(q, include_old=True) is None
+
+
+def _old_doc(latest=True, text="x"):
+    return Document(page_content=text, metadata={"source": "a.pdf", "page": 1, "is_latest": latest})
+
+
+def test_n4_fallback_uses_old_versions_only_after_a_refusal(monkeypatch):
+    answers = iter(["I could not find this in the documents.", "Within 10 working days [1]."])
+    monkeypatch.setattr(app, "generate_answer", lambda q, r, on_token=None: next(answers))
+    monkeypatch.setattr(app, "retrieve", lambda db, q, include_old=False, **kw: [_old_doc(latest=False)])
+    answer, used, old = app.answer_with_fallback(None, "within how many days must a bank credit back?",
+                                                 [_old_doc()])
+    assert old is True and "10 working days" in answer and used[0].metadata["is_latest"] is False
+
+
+def test_n4_no_fallback_when_no_old_document_is_found(monkeypatch):
+    monkeypatch.setattr(app, "generate_answer", lambda q, r, on_token=None: "I could not find this in the documents.")
+    monkeypatch.setattr(app, "retrieve", lambda db, q, include_old=False, **kw: [_old_doc(latest=True)])
+    answer, used, old = app.answer_with_fallback(None, "What is the capital of Australia?", [_old_doc()])
+    assert old is False and app.is_refusal(answer)
+
+
+def test_n4_no_fallback_for_a_real_answer(monkeypatch):
+    monkeypatch.setattr(app, "generate_answer", lambda q, r, on_token=None: "Rs 20,000 [1].")
+    monkeypatch.setattr(app, "retrieve", lambda *a, **k: pytest.fail("must not search again"))
+    assert app.answer_with_fallback(None, "limit?", [_old_doc()])[2] is False
+
+
+def test_n9_fingerprint_is_not_recomputed_when_nothing_changed(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "JSON_FOLDER", tmp_path)
+    (tmp_path / "a.json").write_text("{}", encoding="utf-8")
+    calls = []
+    real = app._data_fingerprint
+    monkeypatch.setattr(app, "_data_fingerprint", lambda s, f: calls.append(1) or real(s, f))
+    app._fingerprints.clear()
+    first = app.data_fingerprint("recursive")
+    assert app.data_fingerprint("recursive") == first and len(calls) == 1
+    (tmp_path / "a.json").write_text('{"changed": 1}', encoding="utf-8")
+    assert app.data_fingerprint("recursive") != first and len(calls) == 2
+
+
+def test_n1_floor_stops_when_pdfs_are_missing(tmp_path, monkeypatch):
+    (tmp_path / "json").mkdir()
+    (tmp_path / "pdfs").mkdir()
+    for name in ("a.pdf", "b.pdf"):
+        (tmp_path / "json" / f"{name}.json").write_text(json.dumps(
+            {"file_name": name, "file_hash": "abc", "metadata": {"doc_type": "rbi_circular"}}), encoding="utf-8")
+    monkeypatch.setattr(app, "JSON_FOLDER", tmp_path / "json")
+    monkeypatch.setattr(ev, "PDF_FOLDER", tmp_path / "pdfs")
+    with pytest.raises(SystemExit, match="2 of 2 PDFs"):
+        ev.page_texts()
+
+
+def test_results_file_gets_new_columns_without_losing_rows(tmp_path, monkeypatch):
+    path = tmp_path / "eval_results.csv"
+    path.write_text("time,setup,hit@1\n2026-11-23 10:00,recursive,0.725\n", encoding="utf-8-sig")
+    monkeypatch.setattr(ev, "RESULTS_FILE", path)
+    s = {"answerable": 1, "no_answer": 0, "hit@1": 1.0, "sec_per_q": 1.0, "answered_on_miss": "0/0"}
+    ev.save_summary("recursive+hybrid", s, {"chat_model": "ollama:qwen3:8b", "test_file": "t.csv"})
+    import csv as _csv
+    rows = list(_csv.DictReader(path.open(encoding="utf-8-sig")))
+    assert [r["setup"] for r in rows] == ["recursive", "recursive+hybrid"]
+    assert rows[0]["hit@1"] == "0.725" and rows[1]["answered_on_miss"] == "0/0"
